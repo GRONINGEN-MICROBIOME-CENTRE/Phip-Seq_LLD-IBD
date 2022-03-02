@@ -7,6 +7,7 @@ library(WGCNA) # https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/Over
 library(tidyverse)
 library(readxl)
 library(igraph)
+library(vegan)
 
 set.seed(1299)
 
@@ -20,11 +21,15 @@ process =  function(Data){
         Data[ , apply(Data, 2, function(x) !any(is.na(x)))] -> Data
         return(Data)
 }
-choose_power = function(Data){
+choose_power = function(Data, Distance_m = F, Distance= NULL){
         #Choosing ideal power function.
         powers = c(c(1:10), seq(from = 12, to=20, by=2))
-        sft = pickSoftThreshold(Data, powerVector = powers, verbose = 5, corFnc = cor )
-
+        if (Distance_m == F){
+                sft = pickSoftThreshold(Data, powerVector = powers, verbose = 5, corFnc = cor )
+        } else{
+                sft = pickSoftThreshold.fromSimilarity(similarity=as.matrix(Distance), powerVector = c(c(1:10), seq(from = 12, to=20, by=2)), verbose=5 )
+                
+        }
         sizeGrWindow(9, 5)
         par(mfrow = c(1,2));
         cex1 = 0.9;
@@ -41,17 +46,111 @@ choose_power = function(Data){
                 main = paste("Mean connectivity"))
         text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
 }
+
+Do_analysis2 =  function(Data, k=7, cutoff=30, minCorrMerge=0.5){
+        #It seems that the automatic block methods is ?always? using unsigned adjacency metrics. So for reproducing paper methos, type shoudl be unsigned
+        #While a correlation-based method accounts for co-absence, using Jaccard instead to produce an adjancecy metric does not
+        #Jaccard-based clustering shows a certain cluster all over the place. While coventional cutting methods of hierarchical clustering cutting
+        #use a unique cutoff (below which we call cluster), WGCNA is using a dynamic tree cut ( https://horvath.genetics.ucla.edu/html/CoexpressionNetwork/BranchCutting/ )
+        #which should be less affected by outliers. In this case, we are using dynamic hybrid, which makes clusters appear all over the place.
+        # https://academic.oup.com/bioinformatics/article/24/5/719/200751?login=true paper discribing the cutting
+        
+        #1. Adjacency
+        #Used in V1 paper
+        adjacency_metric_cor = adjacency(Data, power=k, type = "unsigned")
+        #Using a binary metric: jaccard.
+        adjacency_metric =  (1 - as.matrix(vegdist(t(Data), method = "jaccard")) )^k
+        
+        #2. Getting TOM
+        TOM = TOMsimilarity(adjacency_metric)
+        dissTOM = 1-TOM
+        TOM_cor = TOMsimilarity(adjacency_metric_cor)
+        dissTOM_cor = 1-TOM_cor
+        #Compare TOMs
+        vegan::mantel(dissTOM, dissTOM_cor) #Stat r: 0.23, P<0.001 (999 perm)
+        
+        #3. Hierarchical clustering
+        geneTree = hclust(as.dist(dissTOM), method = "average") 
+        geneTree_cor = hclust(as.dist(dissTOM_cor), method = "average") 
+        #Plotting of similarity of the different features
+        plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity", labels = FALSE, hang = 0.04)
+        #4. Dynamic tree cut  
+        # Module identification using dynamic tree cut: Add a minimum number of peptides per module: cutoff
+        dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                                    deepSplit = 2, pamRespectsDendro = FALSE,
+                                    minClusterSize = cutoff  )
+        Modules_corr = cutreeDynamic(dendro = geneTree_cor, distM = dissTOM_cor,
+                                     deepSplit = 2, pamRespectsDendro = FALSE,
+                                     minClusterSize = cutoff  )
+        
+        #Some summaries, number of samples per module and give colors to those samples
+        table(dynamicMods)
+        dynamicColors = labels2colors(dynamicMods)
+        table(dynamicColors)
+        # Plot the dendrogram and colors underneath
+        sizeGrWindow(8,6)
+        plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                            dendroLabels = FALSE, hang = 0.03,
+                            addGuide = TRUE, guideHang = 0.05,
+                            main = "Gene dendrogram and module colors")
+        #5. Eigengenes and merging of modules which eigengene is closer than a  certain (correlation) threshold with the others
+        #Eigengenes to compute similarity between modules
+        MEList = moduleEigengenes(Data, colors = dynamicColors)
+        MEs = MEList$eigengenes
+        # Calculate dissimilarity of module eigengenes
+        MEDiss = 1-cor(MEs)
+        # Cluster module eigengenes
+        METree = hclust(as.dist(MEDiss), method = "average")
+        # Plot the result
+        sizeGrWindow(7, 6)
+        plot(METree, main = "Clustering of module eigengenes",
+             xlab = "", sub = "")
+        #Set a cutoff for merging modules into one (minCorrMerge), display and merge
+        abline(h=minCorrMerge, col = "red")
+        # Call an automatic merging function
+        merge = mergeCloseModules(Data, dynamicColors, cutHeight = minCorrMerge, verbose = 3)
+        mergedColors = merge$colors
+        # Eigengenes of the new merged modules:
+        mergedMEs = merge$newMEs
+        #Comparison between modules before and after merging
+        sizeGrWindow(12, 9)
+        plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),c("Dynamic Tree Cut", "Merged dynamic"), dendroLabels = FALSE, hang = 0.03, addGuide = TRUE, guideHang = 0.05)
+        #Some renaming
+        moduleColors = mergedColors
+        colorOrder = c("grey", standardColors(50));
+        moduleLabels = match(moduleColors, colorOrder)-1;
+        MEs = mergedMEs
+        
+        
+        table(moduleLabels) -> overview
+        #Visualize similarities between the eigen representation of the modules
+        Correlation_eigen =  cor(MEs)
+        Correlation_eigen[Correlation_eigen>0.999] = NA
+        pheatmap::pheatmap( Correlation_eigen ) -> Plot_heatmap
+        #Plotting distance between all probes,and coloring by module
+        plotTOM = as.matrix(TOM)
+        diag(plotTOM) = NA;
+        sizeGrWindow(9,9)
+        TOMplot(plotTOM, geneTree, moduleColors, main = "Network heatmap plot, all probes") -> Plot_comparison
+        
+        tibble(Probe = colnames(Data), Cluster = moduleLabels, Cluster_cor =as.vector(Modules_corr) ) -> Probes_and_cluster
+
+        
+        return(list(moduleLabels, moduleColors, MEs, geneTree, Plot_tree, Plot_comparison,Probes_and_cluster))
+}
 Do_analysis = function(Data, k=7, cutoff=30){
         #Build network in one command. 
+        
+        
         net = blockwiseModules(Data, power = k,corType = "pearson",
-                       TOMType = "signed", minModuleSize = cutoff,
+                       TOMType = "unsigned", minModuleSize = cutoff,
                        reassignThreshold = 0, mergeCutHeight = 0.5,
                        numericLabels = TRUE, pamRespectsDendro = FALSE,
-                       saveTOMs = T, randomSeed = 1234,
+                       saveTOMs = F, randomSeed = 1234, saveTOMFileBase = "unsignedTOM",
                        verbose = 3)
 
         #Distance matrix is saved in BlockwiseTOM-block.1.RData ; can be loaded by load(lockwiseTOM-block.1.RData)
-        load("BlockwiseTOM-block.1.RData") #It is called TOM
+        #load("BlockwiseTOM-block.1.RData") #It is called TOM
 
         #Data of interest
         moduleLabels = net$colors  #classification in labels
@@ -61,17 +160,18 @@ Do_analysis = function(Data, k=7, cutoff=30){
         #Overview of clusters
         table(moduleLabels) -> overview
         #Plot tree
-        plotDendroAndColors(geneTree, moduleColors, "Module colors" ,dendroLabels = F, addGuide = T) -> Plot_tree
+        #plotDendroAndColors(geneTree, moduleColors, "Module colors" ,dendroLabels = F, addGuide = T) -> Plot_tree
+        Plot_tree = NULL
         #Visualize similarities between the eigen representation of the modules
         Correlation_eigen =  cor(MEs)
         Correlation_eigen[Correlation_eigen>0.999] = NA
         pheatmap::pheatmap( Correlation_eigen ) -> Plot_heatmap
         #Plotting distance between all probes,and coloring by module
-        igraph::graph.adjacency(TOM) -> graph_object
-        plotTOM = as.matrix(TOM)
-        diag(plotTOM) = NA;
-        sizeGrWindow(9,9)
-        TOMplot(plotTOM, geneTree, moduleColors, main = "Network heatmap plot, all probes") -> Plot_comparison
+        #plotTOM = as.matrix(TOM)
+        #diag(plotTOM) = NA;
+        #sizeGrWindow(9,9)
+        #TOMplot(plotTOM, geneTree, moduleColors, main = "Network heatmap plot, all probes") -> Plot_comparison
+        Plot_comparison = NULL #Making heatmap takes really long time
         tibble(Probe = colnames(Data), Cluster = moduleLabels) -> Probes_and_cluster
         
         return(list(moduleLabels, moduleColors, MEs, geneTree, Plot_tree, Plot_comparison,Probes_and_cluster, net))
@@ -85,56 +185,178 @@ process( filter(Data, grepl("32_", ID))) -> Data_LLD #Removal of samples that ar
 read_csv("~/Resilio Sync/Antibodies_WIS (1)/Data and oligo info/Data_subset//2821probes_annotation.csv") -> Annotation #Peptide annotation
 colnames(Annotation)[1] = "Probe"
 
-###OVERALL (LLD+IBD)###
-#Check power
-choose_power(Data_all) #It is recommended to use a number aboce R2 of 0.9, the highest possible before saturation, which in this case is 7
-Do_analysis(Data_all, 7) -> results_all
-Probes_and_cluster = results_all[[7]]
+Check_power_different_distances = function(Data_LLD){
+        ##LLD##
+        choose_power(Data_LLD)
+        #Jaccard
+        choose_power(Data_LLD, Distance_m = T, Distance = vegan::vegdist(Data_LLD, "jaccard") )
+        #Kulczynski, this one is really slow. With a power of 20 it is around 0.6, although it seems that the R2 increases linealy with the power, is not recommended to go really high
+        choose_power(Data_LLD, Distance_m = T, Distance = prabclus::kulczynski(Data_LLD) )
+        
+}
+Other_analyses = function(Data, Data_LLD){
+        #Analyses not included in the paper. Different number of min peptides per module and including IBD samples
+        
+        ###OVERALL (LLD+IBD)###
+        #Check power
+        choose_power(Data_all) #It is recommended to use a number aboce R2 of 0.9, the highest possible before saturation, which in this case is 7
+        Do_analysis(Data_all, 7) -> results_all
+        Probes_and_cluster = results_all[[7]]
+        #Check which are the probes in the same groups
+        Probes_and_cluster %>% filter(Cluster != 0) -> Groups
+        left_join(Groups, Annotation) -> Groups
+        #1 --> CMV , 2 ---> Flagellin, 3 --> Bacteria (allergen?)
+        Groups %>% select(Cluster, Taxa, Description,`comments, synonim, blast, details`) %>% filter(Cluster == 1) %>% print(n=100) #Cluster CMV, turquoise
+        Groups %>% select(Cluster, Taxa, Description, `comments, synonim, blast, details`) %>% filter(Cluster == 2) %>% print(n=100) #Cluster CMV, turquoise
+        Groups %>% select(Cluster, Taxa, Description, `comments, synonim, blast, details`) %>% filter(Cluster == 3) %>% print(n=100) #Cluster CMV, turquoise
 
-#Check which are the probes in the same groups
-Probes_and_cluster %>% filter(Cluster != 0) -> Groups
-left_join(Groups, Annotation) -> Groups
-#1 --> CMV , 2 ---> Flagellin, 3 --> Bacteria (allergen?)
-Groups %>% select(Cluster, Taxa, Description,`comments, synonim, blast, details`) %>% filter(Cluster == 1) %>% print(n=100) #Cluster CMV, turquoise
-Groups %>% select(Cluster, Taxa, Description, `comments, synonim, blast, details`) %>% filter(Cluster == 2) %>% print(n=100) #Cluster CMV, turquoise
-Groups %>% select(Cluster, Taxa, Description, `comments, synonim, blast, details`) %>% filter(Cluster == 3) %>% print(n=100) #Cluster CMV, turquoise
+        Do_analysis(Data_LLD, 7) -> results_LLD
+        Probes_and_cluster_LLD = results_LLD[[7]]
+        Probes_and_cluster_LLD %>% filter(Cluster != 0) -> Groups_LLD ;left_join(Groups_LLD, Annotation) -> Groups_LLD
 
-##LLD##
-choose_power(Data_LLD)
-Do_analysis(Data_LLD, 7) -> results_LLD
-Probes_and_cluster_LLD = results_LLD[[7]]
-Probes_and_cluster_LLD %>% filter(Cluster != 0) -> Groups_LLD ;left_join(Groups_LLD, Annotation) -> Groups_LLD
+        Groups_LLD %>% select(Cluster, Taxa, Description,`comments, synonim, blast, details`) %>% filter(Cluster == 1) %>% print(n=100) #Cluster CMV, turquoise
+        Groups_LLD %>% select(Cluster, Taxa, Description, `comments, synonim, blast, details`) %>% filter(Cluster == 2) %>% print(n=100) #Cluster CMV, turquoise
+        Groups_LLD %>% select(Cluster, Taxa, Description, `comments, synonim, blast, details`) %>% filter(Cluster == 3) %>% print(n=100) #Cluster CMV, turquoise
 
-Groups_LLD %>% select(Cluster, Taxa, Description,`comments, synonim, blast, details`) %>% filter(Cluster == 1) %>% print(n=100) #Cluster CMV, turquoise
-Groups_LLD %>% select(Cluster, Taxa, Description, `comments, synonim, blast, details`) %>% filter(Cluster == 2) %>% print(n=100) #Cluster CMV, turquoise
-Groups_LLD %>% select(Cluster, Taxa, Description, `comments, synonim, blast, details`) %>% filter(Cluster == 3) %>% print(n=100) #Cluster CMV, turquoise
+        results_LLD[[2]][results_LLD[[1]] == 1] #light blue
+        results_LLD[[2]][results_LLD[[1]] == 2] #dark blue
+        results_LLD[[2]][results_LLD[[1]] == 3] #brown\
 
-results_LLD[[2]][results_LLD[[1]] == 1] #light blue
-results_LLD[[2]][results_LLD[[1]] == 2] #dark blue
-results_LLD[[2]][results_LLD[[1]] == 3] #brown\
+        Groups_LLD %>% select(Cluster, Probe,aa_seq) %>% filter(Cluster ==3) -> Cluster_heterogenous
+        Cluster_heterogenous %>% write_tsv("Desktop/Cluster_heterogenous.tsv")
+        write_tsv(Groups_LLD, path = "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Module_belonging_LLD.tsv")
 
-Groups_LLD %>% select(Cluster, Probe,aa_seq) %>% filter(Cluster ==3) -> Cluster_heterogenous
-Cluster_heterogenous %>% write_tsv("Desktop/Cluster_heterogenous.tsv")
-write_tsv(Groups_LLD, path = "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Module_belonging_LLD.tsv")
-
-#Repeat on different cluster number
-#With 20 there is one additional module
-Do_analysis(Data_LLD, 7, 20)  -> results_LLD2
-Probes_and_cluster_LLD2 = results_LLD2[[7]] ; Probes_and_cluster_LLD2 %>% filter(Cluster != 0) -> Groups_LLD2 ;left_join(Groups_LLD2, Annotation) -> Groups_LLD2
-Groups_LLD2 %>% select(Cluster, Taxa, Description, `comments, synonim, blast, details`) %>% filter(Cluster == 4) %>% print(n=100)
-#New cluster consists of 26 probes. No clear taxa or domain, mainly bugs
-results_LLD2[[2]][results_LLD2[[1]] == 4] #yellow cluster
-
-##################Analysis Paper ####################33
+        #Repeat on different cluster number
+        #With 20 there is one additional module
+        Do_analysis(Data_LLD, 7, 20)  -> results_LLD2
+        Probes_and_cluster_LLD2 = results_LLD2[[7]] ; Probes_and_cluster_LLD2 %>% filter(Cluster != 0) -> Groups_LLD2 ;left_join(Groups_LLD2, Annotation) -> Groups_LLD2
+        Groups_LLD2 %>% select(Cluster, Taxa, Description, `comments, synonim, blast, details`) %>% filter(Cluster == 4) %>% print(n=100)
+        #New cluster consists of 26 probes. No clear taxa or domain, mainly bugs
+        results_LLD2[[2]][results_LLD2[[1]] == 4] #yellow cluster
+}
 
 ##1. Identify modules with at least 10 probes per module
-#With 10
+#Check_power_different_distances(Data_LLD)
+#With minimum 10 pepties per module
 Do_analysis(Data_LLD, 7, 10)  -> results_LLD3
 Net =  results_LLD3[[8]]
 Probes_and_cluster_LLD3 = results_LLD3[[7]] ; Probes_and_cluster_LLD3 %>% filter(Cluster != 0) -> Groups_LLD3 ;left_join(Groups_LLD3, Annotation) -> Groups_LLD3
 table(results_LLD3[[2]]) #22 clusters
 #Save
-write_tsv(Groups_LLD3, "Cluster_AtLeast10.tsv")
+write_tsv(Groups_LLD3, "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Cluster_AtLeast10.tsv")
+
+########################
+#Boostrap analysis######
+########################
+Do_boostrap_analysis = function(Data_LLD, Probes_and_cluster_LLD3, N_iterations=10){
+        set.seed(9899)
+        ##1. Run boostraps and save clusters
+        Boostrap_clusters = tibble()
+        #Number of permutations are the number of iterations to do. In each iteration 4 subsets (20%, 40%, 60% and 80%) of data is subsampled
+        for (i in seq(N_iterations) ){
+                print (paste0("Round number", as.character(i) ) )
+                for (a in c(0.2, 0.4, 0.6, 0.8)){
+                      print (paste0("Data subset", as.character(a) ) )
+                      sample(seq(dim(Data_LLD)[1]),a*dim(Data_LLD)[1],replace=F)  -> Boost
+                      Data_LLD[Boost,] -> Boost
+                      Do_analysis(Boost, 7, 10) -> Results_boost
+                      Clusters =  Results_boost[[7]]
+                      Clusters %>% mutate(Percentage = a, Round = i) -> Clusters
+                      rbind(Boostrap_clusters, Clusters) -> Boostrap_clusters
+                }
+        }
+        ##2. Find out which clusters are related.
+        Boostrap_clusters %>% mutate( ID = paste0(Percentage,"-", Round) ) -> Boostrap_clusters
+        Similarity_clusters = tibble()
+        #For each Cluster in the whole dataset, check which are the most similar clusters in each subset of data
+        #For that, we compute Jaccard similarity (1-jaccard) and pick the top closest module. If no module is over 50% similarity it is assumed no matching cluster is present
+        for (Cluster_n in unique(Probes_and_cluster_LLD3$Cluster)){
+                Probes_and_cluster_LLD3 %>% mutate(Presence = (Cluster == Cluster_n))  -> Real
+                for (Round_n in unique(Boostrap_clusters$ID) ){
+                        Similarity_round = tibble()
+                        Boostrap_clusters %>% filter(ID  == Round_n) -> Perm
+                        for (Cluster_n2 in unique(Perm$Cluster)){
+                                Perm %>% mutate(Presence = (Cluster == Cluster_n2)) -> Perm2
+                                Similarity = 1 - vegdist( t(data.frame(as.numeric(Real$Presence), as.numeric(Perm2$Presence))), "jaccard")[1]
+                                Similarity_round %>% rbind( tibble(Sim = Similarity, Cluster_real = Cluster_n, Cluster_perm = Cluster_n2 ))  -> Similarity_round       
+                        }
+                        which.max(Similarity_round$Sim) -> Max_d
+                        which.max(Similarity_round$Sim[-Max_d] ) -> Max_d2
+                        Similarity_round[Max_d,] -> Best_match
+                        Similarity_round[Max_d2,] -> Second_best
+                        Diff = Best_match$Sim - Second_best$Sim
+                        Result_round = tibble(Cluster = Cluster_n, Match =  Best_match$Cluster_perm, Second_match = Second_best$Cluster_perm, Similarity = Best_match$Sim, Difference = Diff, Round = Round_n)
+                        Similarity_clusters %>% rbind(Result_round) -> Similarity_clusters
+                }
+        }
+        Similarity_clusters$Round %>% sapply(function(x){ str_split(x, "-")[[1]][1]  } ) -> Subset_perm
+        Similarity_clusters %>% mutate(Subset = Subset_perm ) -> Similarity_clusters
+        #Plot cluster similarity
+        Similarity_clusters %>% ggplot(aes(x = as.factor(Cluster), y = Similarity)) + geom_boxplot(outlier.shape = NA) + theme_bw()+
+                 geom_hline(yintercept = 0.5)  + coord_flip() + geom_jitter(aes(col=Subset)) -> Plot1
+        Similarity_clusters %>% filter(Similarity>0.5) %>% ggplot(aes(x = as.factor(Cluster), y = Similarity)) + geom_boxplot(outlier.shape = NA) + 
+                geom_jitter(aes(col=Subset)) + theme_bw() + coord_flip() -> Plot2
+        ggsave("~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Bootstrap/Cluster_cluster_top_similarity.pdf", Plot1)
+        
+        
+        ##2.5 Change the cluster value to the ones where they match best.
+        #Relatively long execution time ~10min
+        Boostrap_clusters2 =  Boostrap_clusters
+        library(doParallel)
+        detectCores()
+        registerDoParallel(6)
+        start.time <- Sys.time()
+        foreach( row_n = seq(nrow(Boostrap_clusters)), .combine = "rbind" ) %dopar% {
+                Subset2 = Boostrap_clusters
+                Subset2[row_n,] -> Boostrap_row
+                Similarity_clusters %>% filter(Round == Boostrap_row$ID, Match == Boostrap_row$Cluster) %>% filter(Similarity>0.5) -> Match
+                if(! dim(Match)[1] == 1 ){
+                        C = NA
+                }else{ C = Match$Cluster }
+                Subset2[row_n,2] = C 
+                return(Subset2[row_n,])
+        } -> Boostrap_clusters2
+        end.time <- Sys.time()
+        end.time - start.time
+        
+        #Go row by row, check the cluster and the matching cluster for that boostrap and change the value of the clsuter to the one they match with
+        #for (row_n in  seq(nrow(Boostrap_clusters))){
+        #        Boostrap_clusters2[row_n,] -> Boostrap_row
+        #        Similarity_clusters %>% filter(Round == Boostrap_row$ID, Match == Boostrap_row$Cluster) %>% filter(Similarity>0.5) -> Match
+        #        if(! dim(Match)[1] == 1 ){
+        #                C = NA
+        #        }else{ C = Match$Cluster }
+        #        Boostrap_clusters2[row_n,2] = C
+        #}
+        Boostrap_clusters2 %>% drop_na() -> Boostrap_clusters2
+        
+        ##3. Get consistency of clusters that are meant to represent the same
+        # Done by counting the % of times the cluster in the complete dataset matches the homologous cluster
+        Boostrap_results = tibble()
+        for ( Peptide in Probes_and_cluster_LLD3$Probe ){
+                Probes_and_cluster_LLD3 %>% filter(Probe == Peptide) -> Peptide_choice
+                Boostrap_clusters2 %>% filter(Probe == Peptide) %>% group_by(Percentage, Cluster == Peptide_choice$Cluster) %>% summarise(N = n()) %>%
+                        filter(`Cluster == Peptide_choice$Cluster` == T) %>%  mutate(Stability_perc = 100*N/N_iterations ) %>% dplyr::select(-c(`Cluster == Peptide_choice$Cluster`, N)) %>%
+                         mutate(Peptide = Peptide_choice$Probe, cluster=Peptide_choice$Cluster ,.before=1) -> Res_boost
+                rbind(Boostrap_results,Res_boost) -> Boostrap_results
+        }
+        Boostrap_results %>% spread(Percentage, Stability_perc) -> Boostrap_results
+        Boostrap_results %>% gather(Subset, Consistency, 3:6, factor_key=TRUE) %>% #filter(cluster == 8) %>% drop_na() %>% print(n=20)
+              drop_na() %>%  ggplot(aes(x=Subset, y=Consistency) ) + facet_wrap(~cluster) + geom_boxplot() + theme_bw() -> Plot3
+        ggsave("~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Bootstrap/Peptide_cluster_consistency.pdf", Plot3)
+        
+        
+        Boostrap_results %>% gather(Subset, Consistency, 3:6, factor_key=TRUE) %>% group_by(cluster, Subset) %>% drop_na() %>% summarise(mean(Consistency), median(Consistency))
+        
+        #Save Bootstrap data
+        write_tsv(Boostrap_results, path = "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Bootstrap/Boostrap_results.tsv")
+        write_tsv(Boostrap_clusters2, path = "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Bootstrap/Boostrap_clusters.tsv")
+        write_tsv(Boostrap_clusters, path = "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Bootstrap/Boostrap_raw_clusters.tsv")
+        write_tsv(Similarity_clusters , path = "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Bootstrap/Cluster_similarity.tsv")
+
+}
+
+Do_boostrap_analysis(Data_LLD, Probes_and_cluster_LLD3, N_iterations=50)
 
 
 #############Correlation between modules using eigengenes
@@ -196,6 +418,14 @@ g <- graph.adjacency(
         weighted=TRUE,
         diag=FALSE
 )
+#https://stdworkflow.com/252/the-igraph-package-visualizes-gene-regulatory-networks
+#g = graph.adjacency(
+#        as.matrix( vegdist(Data_LLD, method = "jaccard") ),
+#        mode="undirected",
+#        weighted=TRUE,
+#        diag=FALSE
+#)
+
 g <- simplify(g, remove.multiple=TRUE, remove.loops=TRUE)
 E(g)[which(E(g)$weight<0)]$color <- "darkblue"
 E(g)[which(E(g)$weight>0)]$color <- "darkred"
@@ -292,6 +522,7 @@ for (Fi in files){
 Groups %>% filter(Cluster == 1) %>% select(Probe,  Taxa, Description) %>% print(n=99)
 Similarity_cluster %>% filter(P_mantel>0.05)
 write_tsv(Similarity_cluster,path = "Similarity_scores.tsv")
+
 
 
 
