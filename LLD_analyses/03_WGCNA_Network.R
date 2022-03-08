@@ -200,7 +200,8 @@ Other_analyses = function(Data, Data_LLD){
         ###OVERALL (LLD+IBD)###
         #Check power
         choose_power(Data_all) #It is recommended to use a number aboce R2 of 0.9, the highest possible before saturation, which in this case is 7
-        Do_analysis(Data_all, 7) -> results_all
+        Do_analysis(Data_all, 7, 10) -> results_all
+        ME_all = results_all[[3]]
         Probes_and_cluster = results_all[[7]]
         #Check which are the probes in the same groups
         Probes_and_cluster %>% filter(Cluster != 0) -> Groups
@@ -242,6 +243,27 @@ Do_analysis(Data_LLD, 7, 10)  -> results_LLD3
 Net =  results_LLD3[[8]]
 Probes_and_cluster_LLD3 = results_LLD3[[7]] ; Probes_and_cluster_LLD3 %>% filter(Cluster != 0) -> Groups_LLD3 ;left_join(Groups_LLD3, Annotation) -> Groups_LLD3
 table(results_LLD3[[2]]) #22 clusters
+results_LLD3[[3]] %>% as_tibble() %>% mutate(ID = filter(Data,grepl("32_", ID))$ID, .before=1) %>% select(-ME0) -> EigenGenes
+
+
+#Need to run overall analysis to find a network common with IBD and LLD
+ME_all %>% as_tibble() %>% mutate(ID = Data$ID, .before=1) %>% select(-ME0)  -> EigenGenesAll
+left_join(EigenGenes, EigenGenesAll, by="ID", suffix=c("", "_all")) %>% select(-ID)  %>% cor() -> Cor_all #%>% heatmap()
+hclust(as.dist( 1- Cor_all), method="average") -> CLUSTER
+cutree(CLUSTER, h = 0.05) -> CLUSTER
+for (C in CLUSTER){
+        CLUSTER[CLUSTER==C] -> Pair
+        if (! length(Pair) == 2 ){ next }
+        names(Pair)[grepl("_all", names(Pair))] -> All_cluster
+        Number_change = names(Pair)[! grepl("_all", names(Pair))]
+        str_replace(All_cluster, "_all", "") -> All_cluster
+        EigenGenesAll[ paste0(Number_change, "_complete") ] = EigenGenesAll[,All_cluster]
+}
+select(EigenGenesAll, c("ID", colnames(EigenGenesAll)[grepl("_complete", colnames(EigenGenesAll))] )) -> EigenGenesAll
+colnames(EigenGenesAll) = sapply(colnames(EigenGenesAll), function(x){ str_split(x, "_")[[1]][1] } )
+write_tsv(EigenGenes, "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/EigenGenes.tsv")
+write_tsv(EigenGenesAll, "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/EigenGenes_all.tsv")
+
 #Save
 write_tsv(Groups_LLD3, "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Cluster_AtLeast10.tsv")
 
@@ -257,7 +279,7 @@ Do_boostrap_analysis = function(Data_LLD, Probes_and_cluster_LLD3, N_iterations=
                 print (paste0("Round number", as.character(i) ) )
                 for (a in c(0.2, 0.4, 0.6, 0.8)){
                       print (paste0("Data subset", as.character(a) ) )
-                      sample(seq(dim(Data_LLD)[1]),a*dim(Data_LLD)[1],replace=F)  -> Boost
+                      sample(seq(dim(Data_LLD)[1]),a*dim(Data_LLD)[1],replace=T)  -> Boost
                       Data_LLD[Boost,] -> Boost
                       Do_analysis(Boost, 7, 10) -> Results_boost
                       Clusters =  Results_boost[[7]]
@@ -507,7 +529,7 @@ Compute_heatmap = function(Distance, Name, Subset_info, correlations){
         
 }
 
-files <- list.files(path="~/Desktop/Clusters", pattern="Distance_*", full.names=TRUE, recursive=FALSE)
+files <- list.files(path="/Users/sergio/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Clusters", pattern="Distance_[0-9]+", full.names=TRUE, recursive=FALSE)
 read_tsv("Cluster_AtLeast10.tsv") -> Groups #Cluster belonging
 
 Similarity_cluster = tibble()
@@ -525,5 +547,256 @@ write_tsv(Similarity_cluster,path = "Similarity_scores.tsv")
 
 
 
+###############################################
+#################Analysis Binary Network#######
+###############################################
+library(IsingFit)
+#IsingFit_parl is the IsingFit function, but including 6 core parallelization from the foreach package
+IsingFit_parl <-function(x, family='binomial', AND = TRUE, gamma = 0.25, plot = TRUE, lowerbound.lambda = NA,...){
+  t0 <- Sys.time()
+  xx <- x
+  
+  ## Check to prevent error of lognet() in package glmnet
+  checklognet <- function(y){
+    res <- c() # 0: too little variance, 1: good to go
+    y=as.factor(y)
+    ntab=table(y)
+    minclass=min(ntab)
+    if(minclass<=1) res=0 else res=1
+    return(res)
+  }
+  NodesToAnalyze <- apply(x,2,checklognet) !=0
+  names(NodesToAnalyze) <- colnames(x)
+  if (!any(NodesToAnalyze)) stop("No variance in dataset")
+  if (any(!NodesToAnalyze))
+  { warning(paste("Nodes with too little variance (not allowed):",paste(colnames(x)[!NodesToAnalyze],collapse = ", "))) }
+  ##
+  
+  x <- as.matrix(x)
+  allthemeans <- colMeans(x)
+  x <- x[,NodesToAnalyze,drop=FALSE]
+  nvar <- ncol(x)
+  p <- nvar - 1
+  
+  ##Parallel computation of lasso. GLMNET is used. Default alpha=1 (lasso), it tries several different lambda parameters.
+  nlambdas <- rep(0,nvar)
+  intercepts <- betas <- lambdas <- list(vector,nvar)
+  doParallel::registerDoParallel(6)
+  print("Lasso computation")
+  foreach( i = seq(nvar) ) %dopar% {
+    a <- glmnet::glmnet(x = x[,-i], y = x[,i], family = family)
+    return( list(i, a$a0, a$beta, a$lambda) )
+  } -> Output
+  for (a in Output){
+    i = a[[1]]
+    intercepts[[i]] <- a[[2]] ; betas[[i]] <- a[[3]] ;  lambdas[[i]] <- a[[4]] ; nlambdas[i] <- length( a[[4]]) 
+  }
+  print("Lasso completed")
+  
+  P <- logl <- sumlogl <- J <- matrix(0, max(nlambdas), nvar)
+  #Count how many non 0 parameters were picked by lasso
+  for (i in 1:nvar){
+    J[1:ncol(betas[[i]]),i] <- colSums(as.matrix(betas[[i]]!=0))
+  }
+  logl_M <- P_M <- array(0, dim=c(nrow(x),max(nlambdas), nvar) )
+  N <- nrow(x)
+  print("P-matrix computation")
+  #For each Node (feature) compute per each value of lambda a P_matrix and its log (likelihood?)
+  foreach( i = 1: nvar ) %dopar% {
+    betas.ii <- as.matrix( betas[[i]] )
+    int.ii <- intercepts[[i]]
+    y <- matrix( 0 , nrow=N , ncol= ncol(betas.ii) ) 
+    xi <- x[,-i]
+    NB <- nrow( betas.ii) # number of rows in beta
+    #For each peptide, get the prediction of y for all lambda
+    for (bb in 1:NB){   # bb <- 1
+      y <- y + betas.ii[rep(bb,N),] * xi[,bb]
+    }
+    y <- matrix( int.ii , nrow=N , ncol=ncol(y) , byrow=TRUE ) + y
+    # number of NAs
+    n_NA <- max(nlambdas)-ncol(y)
+    if (n_NA > 0 ){ 
+      for ( vv in 1:n_NA){ 
+        y <- cbind( y , NA ) 
+      } 
+    }
+    # calculate P matrix
+    P = exp(y*x[,i])/(1+exp(y))
+    M = log(P) 
+    return(list(i, P, M))
+  } -> P_matrix_info
+  for (a in P_matrix_info){
+    i = a[[1]]
+    P_M[,,i] <- a[[2]]
+    logl_M[,,i] <- a[[3]]
+  }
+  print("P-matrix computation finished")
+  
+  logl_Msum <- colSums( logl_M , 1, na.rm=FALSE )
+  sumlogl <- logl_Msum 
+  sumlogl[sumlogl==0]=NA
+  penalty <- J * log(nrow(x)) + 2 * gamma * J * log(p)
+  EBIC <- -2 * sumlogl + penalty
+  
+  lambda.mat <- matrix(NA,nrow(EBIC),ncol(EBIC))
+  for (i in 1:nvar){
+    lambda.mat[,i] <- c(lambdas[[i]],rep(NA,nrow(EBIC)-length(lambdas[[i]])))
+  }
+  
+  if(!is.na(lowerbound.lambda)){
+    EBIC <- EBIC/(lambda.mat>=lowerbound.lambda)*1
+  }
+  
+  lambda.opt <- apply(EBIC,2,which.min)
+  lambda.val <- rep(NA,nvar)
+  thresholds <- 0
+  for(i in 1:length(lambda.opt)){
+    lambda.val[i] <- lambda.mat[lambda.opt[i],i]
+    thresholds[i] <- intercepts[[i]][lambda.opt[i]]
+  }
+  weights.opt <- matrix(,nvar,nvar)
+  for (i in 1:nvar){
+    weights.opt[i,-i] <- betas[[i]][,lambda.opt[i]]
+  }
+  asymm.weights <- weights.opt
+  diag(asymm.weights)=0
+  if (AND==TRUE) {
+    adj <- weights.opt
+    adj <- (adj!=0)*1
+    EN.weights <- adj * t(adj)
+    EN.weights <- EN.weights * weights.opt
+    meanweights.opt <- (EN.weights+t(EN.weights))/2
+    diag(meanweights.opt) <- 0 
+  } else {
+    meanweights.opt <- (weights.opt+t(weights.opt))/2
+    diag(meanweights.opt) <- 0
+  }
+  graphNew <- matrix(0,length(NodesToAnalyze),length(NodesToAnalyze))
+  graphNew[NodesToAnalyze,NodesToAnalyze] <- meanweights.opt
+  colnames(graphNew) <- rownames(graphNew) <- colnames(xx)
+  threshNew <- ifelse(allthemeans > 0.5, -Inf, Inf)
+  threshNew[NodesToAnalyze] <- thresholds
+  if (plot==TRUE) notplot=FALSE else notplot=TRUE
+  Res <- list(weiadj = graphNew, thresholds = threshNew, q = q, gamma = gamma, 
+              AND = AND, time = Sys.time() - t0, asymm.weights = asymm.weights,
+              lambda.values = lambda.val)
+  class(Res) <- "IsingFit"
+  return(Res)
+}
+Get_clusters = function(Distance, Data, minCorrMerge=0.5, cutoff=10){
+  geneTree = hclust(as.dist(Distance), method = "average")
+  
+  dynamicMods = cutreeDynamic(dendro = geneTree, distM = Distance,
+                              deepSplit = 2, pamRespectsDendro = FALSE,
+                              minClusterSize = cutoff  )
 
+  #Some summaries, number of samples per module and give colors to those samples
+  table(dynamicMods)
+  dynamicColors = labels2colors(dynamicMods)
+  table(dynamicColors)
+  
+  # Eigengenes and merging of modules which eigengene is closer than a  certain (correlation) threshold with the others
+  #Eigengenes to compute similarity between modules
+  MEList = moduleEigengenes(Data, colors = dynamicColors)
+  MEs = MEList$eigengenes
+  # Calculate dissimilarity of module eigengenes
+  MEDiss = 1-cor(MEs)
+  # Cluster module eigengenes
+  METree = hclust(as.dist(MEDiss), method = "average")
+  # Call an automatic merging function
+  merge = mergeCloseModules(Data, dynamicColors, cutHeight = minCorrMerge, verbose = 3)
+  mergedColors = merge$colors
+  # Eigengenes of the new merged modules:
+  mergedMEs = merge$newMEs
+  #Comparison between modules before and after merging
+  #Some renaming
+  moduleColors = mergedColors
+  colorOrder = c("grey", standardColors(50));
+  moduleLabels = match(moduleColors, colorOrder)-1;
+  MEs = mergedMEs
+  
+  return(list(moduleColors, MEs))
+  
+}
+Compare_clusters = function(Eigen_reference, Eigen){
+  Eigen %>% as_tibble() %>% mutate(ID = filter(Data,grepl("32_", ID))$ID, .before=1) %>% select(-MEgrey) -> EigenGenesBinary
+
+  full_join(EigenGenesBinary, Eigen_reference, by="ID", suffix=c("_binary", "_corr")) %>% select(-ID)  %>% cor() -> Cor_all #%>% heatmap()
+  hclust(as.dist( 1- Cor_all), method="average") -> CLUSTER
+  cutree(CLUSTER, h = 0.05) -> CLUSTER
+  for (C in CLUSTER){
+    CLUSTER[CLUSTER==C] -> Pair
+    if (! length(Pair) == 2 ){ next }
+    names(Pair)[grepl("ME[[:digit:]]+$", names(Pair))] -> Corr_cluster
+    Number_change = names(Pair)[! grepl("ME[[:digit:]]+$", names(Pair)) ]
+    EigenGenesBinary[ Corr_cluster ] = EigenGenesBinary[,Number_change]
+  }
+  return(EigenGenesBinary)
+}
+set.seed(9897)
+#This takes some time to work, so load the RDS file with the output
+IsingFit_parl(Data_LLD, AND=TRUE) -> res_bin #this is a weighted network
+saveRDS(res_bin, "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Binary_network.rds")
+
+##Normalization of the adjacency matrix so that it goes from 0-1
+res_bin$weiadj -> Adj # 0 - inf
+Adj_norm = Adj/max(Adj)
+Adj_norm[Adj_norm<0] = 0
+
+#Create TOM from the adjacency matrix?
+TOM = TOMsimilarity(Adj_norm) #topological overlap of two nodes for unweighted networks ; not sure this would be the right call
+#TOM are meant to identify better clusters in RNAseq data. We can anyway use a dissimilarity measure like 1-Corr (if no negative values I assume). We can also transform the negative values
+
+#Define distance matrices
+Dist_tom = 1-TOM
+Dist = 1 - Adj_norm
+
+Get_clusters(Dist, Data_LLD) -> Results1
+Get_clusters(Dist_tom, Data_LLD) -> Results2
+
+#Do any of the cluster belongings resamble the correlation based?
+#8 of 12 have homologous
+Compare_clusters(Eigen = Results1[[2]], Eigen_reference = EigenGenes) -> NewClusters
+#9 of  have hologous 21
+Compare_clusters(Eigen = Results2[[2]], Eigen_reference = EigenGenes)
+
+#Compare both methods
+Results1[[2]] %>% as_tibble() %>% mutate(ID = filter(Data,grepl("32_", ID))$ID, .before=1) %>% select(-MEgrey) -> EigenGenesBinary
+colnames(EigenGenesBinary) = c("ID", paste0("ME", seq(1:(dim(EigenGenesBinary)[2]-1) ) )  )
+#11 homologous refs out of 23 found in TOM out of 12 possible homologous in the non-TOM: missing 8
+Compare_clusters(Eigen = Results2[[2]], Eigen_reference = EigenGenesBinary)
+
+#Check which clusters were reproduced and which are new
+NewClusters %>% select(-ID) %>% cor() -> ClustersCor
+ClustersCor %>% as.data.frame() %>% rownames_to_column("Cluster") %>% as_tibble() %>% filter( grepl( "ME[[:digit:]]+$",Cluster )) %>% select(- rownames(ClustersCor)[grepl( "ME[[:digit:]]+$",rownames(ClustersCor))]) -> ClustersCor
+ClustersCor %>% apply(1, function(x){  names(x)[as.numeric(x) == 1] } ) -> Reproduced
+Reproduced[! is.na(Reproduced)] -> Reproduced
+#New 4 clusters
+NewClusters %>% select(one_of(colnames(ClustersCor))) %>% select(- Reproduced ) -> NewClusters
+tibble( Peptide = colnames(Data_LLD), Cluster = paste0("ME", Results1[[1]]) ) %>% filter( Cluster %in% colnames(NewClusters)) -> NewClustersPeptides
+#Add Annotation
+read_excel("~/Resilio Sync/Antibodies_WIS (1)/Results/Supplemenatry_Tables/SupplementaryTable1.xlsx", sheet = 2) -> AB_annotation
+left_join(NewClustersPeptides, select(AB_annotation, c(Peptide, Taxa, Description))) -> NewClustersPeptides
+#CLusters with several identical bacteria: 
+#Pink (4 Bacteroides dorei and 3 Bacteroides), Red (root 3, B. fragilis 2, Lachnospiraceae 2 ), Brown (Ligonella 2), Green (Clostridiales 2)
+NewClustersPeptides %>% group_by(Cluster, Taxa) %>% summarise(N = n()) %>% arrange(desc(N))
+#Brown: 2 allergens + phages + Bugs
+#Green: Mosqito + Bugs
+#Pink: Bacteroides: TOnB receptor, STN domain-containing (foundin TOnB)
+#Red: Bacteria (D-galactose/ D-glucose-binding protein ,  Peripla_BP_4 domain-containing protein, Peptidase_M48 domain-containing protein)  + EBV
+write_tsv(NewClustersPeptides,"Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/NewClustersBinary.tsv")
+
+files <- list.files(path="/Users/sergio/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Clusters", pattern="Distance_[^0-9]+", full.names=TRUE, recursive=FALSE)
+Similarity_cluster = tibble()
+for (Fi in files){
+  basename(tools::file_path_sans_ext(Fi) ) -> N
+  NewClustersPeptides %>% filter(Cluster ==str_split(N, "_")[[1]][2])  ->Subset_info
+  Compute_heatmap(Fi, N, Subset_info, correlations) -> D
+  print(paste(N, D))
+  rbind(Similarity_cluster, mutate(D, Cluster = str_split(N, "_")[[1]][2]) ) -> Similarity_cluster
+}
+
+Groups %>% filter(Cluster == 1) %>% select(Probe,  Taxa, Description) %>% print(n=99)
+Similarity_cluster %>% filter(P_mantel>0.05)
+write_tsv(Similarity_cluster,path = "Similarity_scores.tsv")
 
