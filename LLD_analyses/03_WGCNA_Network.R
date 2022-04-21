@@ -8,6 +8,7 @@ library(tidyverse)
 library(readxl)
 library(igraph)
 library(vegan)
+library(ggtree)
 
 set.seed(1299)
 
@@ -406,10 +407,14 @@ pheatmap::pheatmap(Cor_modules) #Modules 18, 17,14 and ?0? are related
 ###Plot piechart of composition per cluster##########
 #####################################################
 #Load cluster with annotation
-readxl::read_xlsx("Cluster_AtLeast10.xlsx") -> Annotation_groups
+readxl::read_xlsx("~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Correlation_vs_Similarity/Cluster_AtLeast10.xlsx") -> Annotation_groups
 Annotation_groups %>% group_by(Cluster, High_taxonomy) %>% summarise(N = n()) -> Composition_cluster
 New_cluster = tibble()
 Colors_do = c25[2: length(c25)] ; Colors_do[6] = c25[11]
+annoCol<-list(High_taxonomy=c(Aves=Colors_do[1], Bacteria = Colors_do[2], Fungi=Colors_do[3], 
+                         Invertebrate = Colors_do[4], Mammal=Colors_do[5], Phage=Colors_do[6],
+                         Plant = Colors_do[7], Virus = Colors_do[8]))
+tibble_colors = tibble(High_taxonomy = names(annoCol$High_taxonomy), Value = annoCol$High_taxonomy )
 #Make fractions of each category per cluster
 for (C in unique(Composition_cluster$Cluster)){
         Composition_cluster %>% filter(Cluster == C) -> subset_composition
@@ -421,7 +426,7 @@ for (C in unique(Composition_cluster$Cluster)){
 #Plot
 ggplot(New_cluster, aes(x="", y=Fraction, fill=High_taxonomy)) + geom_bar(stat="identity", width=1, color="white") +
         coord_polar("y", start=0) + theme_void() + facet_wrap(~Cluster) + scale_fill_manual(values=Colors_do) -> Piecharts
-ggsave("Piecharts_moduleComposition.pdf")
+ggsave("~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Correlation_vs_Similarity/Piecharts_moduleComposition.pdf")
 
 ##################################
 ##Network visualization###########
@@ -433,60 +438,155 @@ Network_labels %>% filter(Name %in% colnames(Module_info)) -> Network_labels
 
 dev.off()
 
+Make_graph = function(Module_info, Network_labels, Annotation_groups,tibble_colors, Scale_by_prev = T, Title="Co-occurrence modules"){
+  set.seed(8794)
+  g <- graph.adjacency( as.matrix(as.dist(cor(Module_info, method="pearson"))),
+        mode="undirected", weighted=TRUE,diag=FALSE)
+  #https://stdworkflow.com/252/the-igraph-package-visualizes-gene-regulatory-networks
+  g <- simplify(g, remove.multiple=TRUE, remove.loops=TRUE)
+  E(g)[which(E(g)$weight<0)]$color <- "darkblue"
+  E(g)[which(E(g)$weight>0)]$color <- "darkred"
+  E(g)$weight <- abs(E(g)$weight)
+  g <- delete_edges(g, E(g)[which(E(g)$weight<0.3)])
+  V(g)$name <- Network_labels$Cluster
+  V(g)$shape <- "circle" ; V(g)$color <- "skyblue" ; V(g)$vertex.frame.color <- "white"
+  V(g)$label.cex = Network_labels$Cluster
 
-g <- graph.adjacency(
-        as.matrix(as.dist(cor(Module_info, method="pearson"))),
-        mode="undirected",
-        weighted=TRUE,
-        diag=FALSE
-)
-#https://stdworkflow.com/252/the-igraph-package-visualizes-gene-regulatory-networks
-#g = graph.adjacency(
-#        as.matrix( vegdist(Data_LLD, method = "jaccard") ),
-#        mode="undirected",
-#        weighted=TRUE,
-#        diag=FALSE
-#)
+  if (Scale_by_prev == T){
+    scale01 <- function(x){(x-min(x))/(max(x)-min(x))}
+    vSizes <- (scale01(apply(Module_info, 2, mean)) ) * 10 #Scaled by prevalnece
+  } else { vSizes = 10 }
+  edgeweights <- E(g)$weight * 2.0
+  mst <- mst(g, algorithm="prim")
+  
+  mst.communities <- edge.betweenness.community(mst, weights=NULL, directed=FALSE)
+  mst.clustering <- make_clusters(mst, membership=as.vector(Network_labels$Cluster ))
 
-g <- simplify(g, remove.multiple=TRUE, remove.loops=TRUE)
-E(g)[which(E(g)$weight<0)]$color <- "darkblue"
-E(g)[which(E(g)$weight>0)]$color <- "darkred"
-E(g)$weight <- abs(E(g)$weight)
-g <- delete_edges(g, E(g)[which(E(g)$weight<0.3)])
-V(g)$name <- Network_labels$Cluster
-V(g)$shape <- "circle" ; V(g)$color <- "skyblue" ; V(g)$vertex.frame.color <- "white"
-V(g)$label.cex = Network_labels$Cluster
+  #Color choosing so that they are consistent with the ones used for piecharts
+  left_join(tibble(Probe = colnames(Module_info)) ,  select(Annotation_groups, c(Probe, High_taxonomy))) -> ForColors
+  #as.factor(ForColors$High_taxonomy) -> ForColors2
+  #Colors_do[1: length(levels(ForColors2))] -> Colors_do
+  #tibble( High_taxonomy = levels(ForColors2), Color = Colors_do ) -> Colors
+  left_join(select(Annotation_groups, c(Probe, High_taxonomy)), tibble_colors  ) -> Colors
+  left_join(ForColors , Colors) -> Colors
+  V(mst)$color <- Colors$Value
+  #####
+  plot(mst, layout=layout.fruchterman.reingold, edge.curved=TRUE, vertex.size=vSizes,
+     vertex.label.dist=0, vertex.label.color="white", asp=FALSE,
+     vertex.label.cex=0.4, edge.width=edgeweights, edge.arrow.mode=0,
+    main=Title, vertex.color=V(mst)$color)
+}
+Make_graph(Module_info, Network_labels, Annotation_groups)
 
-scale01 <- function(x){(x-min(x))/(max(x)-min(x))}
-vSizes <- (scale01(apply(Module_info, 1, mean)) ) * 10 #Scaled by prevalnece
-edgeweights <- E(g)$weight * 2.0
-mst <- mst(g, algorithm="prim")
+##############################################
+###Generate logos and conservation plots######
+##############################################
+Tree_with_Alignment = function(Cluster, Module_info, Labels_cluster,Annotation_groups, Distance_to_use = "Similarity"){
+  #Plot tree with sequence similarity
+  #Color scheme from MEME
+  Colors_aa = c("dark blue","dark blue","dark blue","dark blue","dark blue","dark blue","dark blue","dark blue",
+                "#C8A2C8","#C8A2C8",
+                "orange","pink", "yellow", "light blue",
+                "red", "red",
+                "dark green", "dark green", "dark green", "dark green", "grey")
+  names(Colors_aa) = tolower(c("A", "C", "F","I","L","M","V","W",
+                               "D","E",
+                               "G", "H", "P","Y",
+                                "K", "R", 
+                                "N","Q", "S","T", "-"))
+  #Color scheme from internet
+  #Colors_aa = c("light green","light green","red","red","green","blue","blue","blue","pink","#C8A2C8","#C8A2C8","blue","#C8A2C8","dark green", "dark green", "dark blue", "dark green","dark green","orange","orange",NA)
+  #names(Colors_aa) = tolower(c("G", "A", "S","T","C","V","I","L","P","F","Y", "M", "W", "N", "Q", "H","D", "E","K", "R", "-"))
+                
+  if (Distance_to_use == "Similarity"){
+    Distance = paste0("/Users/sergio/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Clusters/Distance_",as.character(Cluster),".mat")
+    read.table(Distance, row.names=1, skip=1) -> Distance
+    lapply(rownames(Distance), function(x){ str_split(x,":")[[1]][1] } ) %>% unlist() -> Names
+    rownames(Distance) = Names
+    colnames(Distance) = rownames(Distance)
+  }else{
+    select(Module_info, Labels_cluster$Name) %>% cor() -> Distance
+    abs(Distance-1) %>% as.dist() %>% hclust(method = "average") -> Tree
+  }
+  Distance %>% as.dist() %>% hclust(method = "average") -> Tree
+  ape::as.phylo(Tree) -> Tree
+  filter(Annotation_groups, Probe %in% Labels_cluster$Name) -> Anno
+  ggtree(Tree)  %<+% Anno + geom_tippoint(aes(color = High_taxonomy), size=3) + geom_tiplab(size=2,offset=0.05) + xlim(-.1, 2) + scale_color_manual(values=Cols_plot$Value) + theme(legend.position="none") -> p
+  msaplot(p, paste0("~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Alignments/",as.character(Cluster),".fasta"), offset=0.55, width=3, color = Colors_aa) + theme(legend.position="none")  -> MSA_plot
+  H = 74 #74
+  ggsave(filename = paste0("~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Alignments/Tree_and_MSA_",as.character(Cluster),".pdf") , MSA_plot,width =120 ,height =H ,units = "mm")
+  
+}
+Logo_from_alignment = function(Cluster){
+  library(Biostrings)
+  library(ggseqlogo)
+  #Colors_aa = c("light green","light green","red","red","green","blue","blue","blue","pink","#C8A2C8","#C8A2C8","blue","#C8A2C8","dark green", "dark green", "dark blue", "dark green","dark green","orange","orange",NA)
+  #names(Colors_aa) = c("G", "A", "S","T","C","V","I","L","P","F","Y", "M", "W", "N", "Q", "H","D", "E","K", "R", "-")
+  Colors_aa = c("dark blue","dark blue","dark blue","dark blue","dark blue","dark blue","dark blue","dark blue",
+                "#C8A2C8","#C8A2C8",
+                "orange","pink", "yellow", "light blue",
+                "red", "red",
+                "dark green", "dark green", "dark green", "dark green", "grey")
+  names(Colors_aa) = c("A", "C", "F","I","L","M","V","W",
+                               "D","E",
+                               "G", "H", "P","Y",
+                               "K", "R", 
+                               "N","Q", "S","T", "-")
+  
+  FASTA = paste0("~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Alignments/",as.character(Cluster),".fasta")
+  s = readAAStringSet(FASTA, format = "fasta")
+  
+  #Compute and save Inofrmation content plot
+  consensusMatrix(s)  -> Count_s
+  Count_s %>% apply(2, function(Ex){ 
+          #Ex + 1 -> Ex # We add a pseudocount
+          sum(Ex) -> Denominator_freq
+          Fex = Ex / Denominator_freq #Probability of each AA
+          #Fex[2:length(Fex)] -> Fex #We do not take the gap
+          -1 * sum(Fex[Fex != 0] * log2(Fex[Fex != 0])) -> Entropy
+          Information = log2(21) - Entropy
+          return(Information)
+  }) -> Information_per_aa
+  Count_s %>% apply(2, function(Ex){ 1 - (Ex[1]/sum(Ex)) }) -> Prevalence
+  Count_s %>% apply(2, function(Ex){rownames(Count_s)[ which.max(Ex)] } ) -> Majority_voting
+  tibble(Seq = seq(length(Information_per_aa)), H =Information_per_aa, Prevalence= as.numeric(Prevalence), Consensus=as.factor(Majority_voting) ) %>% ggplot(aes(x=Seq, y = H, alpha=Prevalence)) + geom_bar(stat="identity", aes(fill=Consensus)) + theme_bw() +
+  geom_hline(yintercept = log2(21),linetype = 'dotted', alpha =0.5)  + theme(panel.grid = element_blank(),
+          axis.title = element_blank(), axis.text.x = element_blank()) + scale_fill_manual(values = Colors_aa ) + theme(legend.position="none")  -> Information_plot
+  ggsave(filename = paste0("~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Alignments/Information_content_",as.character(Cluster),".pdf") , Information_plot, width = 207.151, height = 16.826, units = "mm" )
+  
+  #Generate sequence logo
+  
+  #Clip extremes with many gaps. Many Gaps >= 3/4 total sequences with gaps
+  consensusMatrix(s)[1,] >= 3*length(s)/4 -> Many_gaps
+  cumsum(Many_gaps) -> Many_gaps_cum
+  cumsum(rev(Many_gaps)) -> Many_gaps_cum_rev
+  sapply(seq(Many_gaps_cum)[2:length(Many_gaps_cum)], function(x){ Many_gaps_cum[x-1] ==   Many_gaps_cum[x]  }  ) -> Identical
+  sapply(seq(Many_gaps_cum_rev)[2:length(Many_gaps_cum_rev)], function(x){ Many_gaps_cum_rev[x-1] ==   Many_gaps_cum_rev[x]  }  ) -> Identical_rev
+  
+  match(T, Identical) -> Clip_position_b
+  match(T, Identical_rev) -> Clip_position_e
 
-mst.communities <- edge.betweenness.community(mst, weights=NULL, directed=FALSE)
-mst.clustering <- make_clusters(mst, membership=as.vector(Network_labels$Cluster ))
-
-#Color choosing so that they are consistent with the ones used for piecharts
-left_join(tibble(Probe = colnames(Module_info)) ,  select(Annotation_groups, c(Probe, High_taxonomy))) -> ForColors
-as.factor(ForColors$High_taxonomy) -> ForColors2
-Colors_do[1: length(levels(ForColors2))] -> Colors_do
-tibble( High_taxonomy = levels(ForColors2), Color = Colors_do ) -> Colors
-left_join(ForColors , Colors) -> Colors
-V(mst)$color <- Colors$Color
-#####
-plot(mst,
-     layout=layout.fruchterman.reingold,
-     edge.curved=TRUE,
-     vertex.size=vSizes,
-     vertex.label.dist=0,
-     vertex.label.color="white",
-     asp=FALSE,
-     vertex.label.cex=0.4,
-     edge.width=edgeweights,
-     edge.arrow.mode=0,
-     main="Co-occurrence modules", vertex.color=V(mst)$color)
-
-
-
+  subseq(s, Clip_position_b + 1,  length(Many_gaps) - (Clip_position_e - 1)  ) -> s_subset
+  #plot
+  ggplot()  + geom_logo( as.character(s_subset)) + theme_logo() + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank())   -> Plot
+  ggsave(filename = paste0("~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Alignments/Logo_",as.character(Cluster),".pdf") , Plot)
+}
+  
+#Make plots for some specific clusters
+for (Cluster_i in unique(Network_labels$Cluster) ){
+  Network_labels %>% filter(Cluster == Cluster_i) -> Labels_cluster
+  New_cluster %>% mutate(High_taxonomy = factor(High_taxonomy)) %>% filter(Cluster==Cluster_i) -> To_plot
+  Cols_plot = filter(tibble_colors, High_taxonomy %in% To_plot$High_taxonomy)
+  #Graph  
+  Make_graph(select(Module_info, Labels_cluster$Name), Labels_cluster, filter(Annotation_groups, Probe %in% Labels_cluster$Name), Scale_by_prev = F, Title=NA, tibble_colors)
+  #Pie chart
+  To_plot %>% ggplot(aes(x="", y=Fraction, fill=High_taxonomy)) + geom_bar(stat="identity", width=1, color="white") +
+    coord_polar("y", start=0) + theme_void() +  theme(legend.position="none")  + scale_fill_manual(values=Cols_plot$Value) %>% print()
+  #Tree and alignment plot
+  Tree_with_Alignment(Cluster_i, Module_info, Labels_cluster,Annotation_groups, Distance_to_use = "Similarity")
+  #Make Logo and information content plots
+  Logo_from_alignment(Cluster_i)
+}
 
 #######################################
 ####Analisis all distance matrices#####
@@ -494,14 +594,15 @@ plot(mst,
 #For this distance matrices between peptides in each module should be available
 
 Compute_heatmap = function(Distance, Name, Subset_info, correlations){
-        Out =   "" #Output path
+        Out =   "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Correlation_vs_Similarity/" #Output path
         breaksList = seq(0, 1, by = 0.1)
         read.table(Distance, row.names=1, skip=1) -> Distance
         lapply(rownames(Distance), function(x){ str_split(x,":")[[1]][1] } ) %>% unlist() -> Names
         rownames(Distance) = Names
         colnames(Distance) = rownames(Distance)
+        Annotation_groups %>% select(Probe, High_taxonomy) %>% as.data.frame() %>% column_to_rownames("Probe") -> Annotation
         png(file= paste(Out, Name, "_similarity.png" ) )
-        pheatmap::pheatmap(Distance, color=viridis::viridis(10), breaks = breaksList, main = Name)
+        pheatmap::pheatmap(Distance, color=viridis::viridis(10), breaks = breaksList, main = Name, annotation_row = Annotation, annotation_colors =  annoCol )
         dev.off()
         
         Distance2 = Distance[upper.tri(Distance)]
@@ -520,6 +621,11 @@ Compute_heatmap = function(Distance, Name, Subset_info, correlations){
         corrplot::corrplot(as.matrix(New_matrix), diag=FALSE, tl.col="black")
         dev.off()
         
+        New_matrix = as.matrix(New_matrix)
+        diag(New_matrix) = NA
+        png(file= paste(Out, Name, "_simVScorr_AnnoHeatmap.png" ) )
+        pheatmap::pheatmap(New_matrix, color=RColorBrewer::brewer.pal(name = "Blues", n = 9), breaks = breaksList, annotation_row = Annotation, annotation_colors =  annoCol, cluster_rows = F, cluster_cols  = F, annotation_legend = F)
+        dev.off()
         #Get P-value
         vegan::mantel( as.dist(Corr_matrix) , as.dist(1-Distance), method = "spearman", permutations = 2000, na.rm = TRUE) -> Correlation_result
         r = Correlation_result$statistic
@@ -530,13 +636,13 @@ Compute_heatmap = function(Distance, Name, Subset_info, correlations){
 }
 
 files <- list.files(path="/Users/sergio/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Clusters", pattern="Distance_[0-9]+", full.names=TRUE, recursive=FALSE)
-read_tsv("Cluster_AtLeast10.tsv") -> Groups #Cluster belonging
+read_tsv("/Users/sergio/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Cluster_AtLeast10.tsv") -> Groups #Cluster belonging
 
 Similarity_cluster = tibble()
 for (Fi in files){
         basename(tools::file_path_sans_ext(Fi) ) -> N
-        Groups %>% filter(Cluster == as.numeric(str_split(N, "_")[[1]][2]) ) ->Subset_info
-        Compute_heatmap(Fi, N, Subset_info, correlations) -> D
+        Annotation_groups %>% filter(Cluster == as.numeric(str_split(N, "_")[[1]][2]) ) ->Subset_info
+        Compute_heatmap(Distance =Fi, Name = N, Subset_info, correlations) -> D
         print(paste(N, D))
         rbind(Similarity_cluster, mutate(D, Cluster = str_split(N, "_")[[1]][2]) ) -> Similarity_cluster
 }
@@ -786,6 +892,8 @@ NewClustersPeptides %>% group_by(Cluster, Taxa) %>% summarise(N = n()) %>% arran
 #Red: Bacteria (D-galactose/ D-glucose-binding protein ,  Peripla_BP_4 domain-containing protein, Peptidase_M48 domain-containing protein)  + EBV
 write_tsv(NewClustersPeptides,"Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/NewClustersBinary.tsv")
 
+
+###Seqeuence Similarity and co-occurrence 
 files <- list.files(path="/Users/sergio/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Clusters", pattern="Distance_[^0-9]+", full.names=TRUE, recursive=FALSE)
 Similarity_cluster = tibble()
 for (Fi in files){
