@@ -830,19 +830,21 @@ Compare_clusters = function(Eigen_reference, Eigen){
   full_join(EigenGenesBinary, Eigen_reference, by="ID", suffix=c("_binary", "_corr")) %>% select(-ID)  %>% cor() -> Cor_all #%>% heatmap()
   hclust(as.dist( 1- Cor_all), method="average") -> CLUSTER
   cutree(CLUSTER, h = 0.05) -> CLUSTER
+  Matches = tibble()
   for (C in CLUSTER){
     CLUSTER[CLUSTER==C] -> Pair
     if (! length(Pair) == 2 ){ next }
     names(Pair)[grepl("ME[[:digit:]]+$", names(Pair))] -> Corr_cluster
     Number_change = names(Pair)[! grepl("ME[[:digit:]]+$", names(Pair)) ]
+    Matches = rbind(Matches, tibble(New = names(Pair)[1] , Reference = names(Pair)[2] ) )
     EigenGenesBinary[ Corr_cluster ] = EigenGenesBinary[,Number_change]
   }
-  return(EigenGenesBinary)
+  return(list(EigenGenesBinary, Matches))
 }
 set.seed(9897)
 #This takes some time to work, so load the RDS file with the output
 IsingFit_parl(Data_LLD, AND=TRUE) -> res_bin #this is a weighted network
-saveRDS(res_bin, "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Binary_network.rds")
+saveRDS(res_bin, "~/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/BinaryNetwork/Binary_network.rds")
 
 ##Normalization of the adjacency matrix so that it goes from 0-1
 res_bin$weiadj -> Adj # 0 - inf
@@ -860,9 +862,18 @@ Dist = 1 - Adj_norm
 Get_clusters(Dist, Data_LLD) -> Results1
 Get_clusters(Dist_tom, Data_LLD) -> Results2
 
+read_excel("~/Resilio Sync/Antibodies_WIS (1)/Results/Supplemenatry_Tables/SupplementaryTable1.xlsx", sheet = 2) -> AB_annotation
+
 #Do any of the cluster belongings resamble the correlation based?
 #8 of 12 have homologous
+#method returns the dataframe of the eigengens in Eigen + The homologous egengenes from reference
 Compare_clusters(Eigen = Results1[[2]], Eigen_reference = EigenGenes) -> NewClusters
+NewClusters[[2]] %>% distinct() -> Matches
+NewClusters[[1]] -> NewClusters
+tibble( Peptide = colnames(Data_LLD), Cluster = paste0("ME", Results1[[1]]) ) %>% filter(! Cluster == "MEgrey") -> ClustersPeptides
+colnames(Matches) = c("Cluster", "Homologous_WGCNA")
+left_join(ClustersPeptides, Matches) %>% arrange(Cluster) %>% left_join( select(AB_annotation, c(Peptide, Taxa, Description))) -> ClustersBinary
+write_tsv(ClustersBinary, "Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/BinaryNetwork/ClustersBinary.tsv")
 #9 of  have hologous 21
 Compare_clusters(Eigen = Results2[[2]], Eigen_reference = EigenGenes)
 
@@ -881,19 +892,17 @@ Reproduced[! is.na(Reproduced)] -> Reproduced
 NewClusters %>% select(one_of(colnames(ClustersCor))) %>% select(- Reproduced ) -> NewClusters
 tibble( Peptide = colnames(Data_LLD), Cluster = paste0("ME", Results1[[1]]) ) %>% filter( Cluster %in% colnames(NewClusters)) -> NewClustersPeptides
 #Add Annotation
-read_excel("~/Resilio Sync/Antibodies_WIS (1)/Results/Supplemenatry_Tables/SupplementaryTable1.xlsx", sheet = 2) -> AB_annotation
 left_join(NewClustersPeptides, select(AB_annotation, c(Peptide, Taxa, Description))) -> NewClustersPeptides
 #CLusters with several identical bacteria: 
 #Pink (4 Bacteroides dorei and 3 Bacteroides), Red (root 3, B. fragilis 2, Lachnospiraceae 2 ), Brown (Ligonella 2), Green (Clostridiales 2)
 NewClustersPeptides %>% group_by(Cluster, Taxa) %>% summarise(N = n()) %>% arrange(desc(N))
-#Brown: 2 allergens + phages + Bugs
-#Green: Mosqito + Bugs
-#Pink: Bacteroides: TOnB receptor, STN domain-containing (foundin TOnB)
-#Red: Bacteria (D-galactose/ D-glucose-binding protein ,  Peripla_BP_4 domain-containing protein, Peptidase_M48 domain-containing protein)  + EBV
-write_tsv(NewClustersPeptides,"Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/NewClustersBinary.tsv")
+#Brown: 2 allergens + phages + Bugs -> No high identity
+#Green: Mosqito + Bugs  --> No high identity
+#Pink: Bacteroides: TOnB receptor, STN domain-containing (foundin TOnB) --> Homologous
+#Red: Bacteria (D-galactose/ D-glucose-binding protein ,  Peripla_BP_4 domain-containing protein, Peptidase_M48 domain-containing protein)  + EBV --> Common motif in bacterial
+write_tsv(NewClustersPeptides,"Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/BinaryNetwork/NewClustersBinary.tsv")
 
-
-###Seqeuence Similarity and co-occurrence 
+###Seqeuence Similarity of new modules 
 files <- list.files(path="/Users/sergio/Resilio Sync/Antibodies_WIS (1)/Results/Network_analysis/Clusters", pattern="Distance_[^0-9]+", full.names=TRUE, recursive=FALSE)
 Similarity_cluster = tibble()
 for (Fi in files){
@@ -907,4 +916,22 @@ for (Fi in files){
 Groups %>% filter(Cluster == 1) %>% select(Probe,  Taxa, Description) %>% print(n=99)
 Similarity_cluster %>% filter(P_mantel>0.05)
 write_tsv(Similarity_cluster,path = "Similarity_scores.tsv")
+
+
+#New figure 2
+Data %>% select( c("ID", Groups_LLD3$Probe) ) %>% select( -ID ) %>% cor() -> Corr_Matrix_Modules
+left_join( Network_labels, select(mutate(Annotation_groups, Name = Probe), c(Name, Cluster, High_taxonomy) )  ) -> Network_labels
+Network_labels %>% mutate(Cluster = as.factor(Cluster)) %>% as.data.frame() %>% column_to_rownames("Name") %>% select(-Color) -> Annotation_heatmap
+#Color
+annotation_colors = unique(Network_labels$Color ) 
+names(annotation_colors) = unique(Network_labels$Cluster)
+
+annotation_colors2 = Colors_do[1: length(unique(Network_labels$High_taxonomy)) ]
+names(annotation_colors2) = sort(unique(Network_labels$High_taxonomy))
+
+
+list(  Cluster = annotation_colors, High_taxonomy= annotation_colors2  ) -> annotation_colors
+pheatmap::pheatmap(Corr_Matrix_Modules, annotation_row = Annotation_heatmap, annotation_colors =  annotation_colors, labels_row = rep("", nrow(Corr_Matrix_Modules) ) , labels_col = rep("", nrow(Corr_Matrix_Modules) ) )
+Annotation_groups %>% group_by(Cluster, High_taxonomy) %>% summarise(N = n()) -> Composition_cluster
+
 
