@@ -5,9 +5,10 @@ library(patchwork)
 library(stats)
 library(viridis)
 
+Data_matrix="" #Location were post-Selection matrix of presence/absence peptides is lcoated
 
 #Data and covariates reading
-Data = readRDS(file = "Data/Immuno_matrix_postSelection.rds")
+Data = readRDS(file = Data_matrix)
 #Removal of samples that belong to CeD cohort
 Cohort = sapply(Data$ID, function(x){ str_split(x, "_")[[1]][1] } ) %>% as_vector() -> cohorts
 Data %>% mutate(Cohort = cohorts) %>% filter(!Cohort == "34") -> Data
@@ -37,7 +38,7 @@ DO_PCA = function(Data, permanova=F, Cluster=NULL){
         print( paste(c("Data size: ", as.character(dim(Data)[1]) ), collapse = "" ) )
         print( paste(c("Data with Metadata: ", as.character(dim(Data2)[1]) ), collapse = "" ) )
 
-        #Get_clusters(Data2) -> Cluster_belonging
+      
         #PCA
         Data2 %>% select_if(~ !any(is.na(.))) -> Data2
         PCA <- rda(Data2, scale = FALSE)
@@ -61,17 +62,20 @@ DO_PCA = function(Data, permanova=F, Cluster=NULL){
         #PCs needed to reach 90%
         Scree_input %>% filter(`Cumulative Proportion` >= 0.9) %>% head(1) -> Min_PC
 
-        #Check major contributors of PCs
+        #Check major contributors to first 100 PCs
         scores(PCA,seq(100))$species %>% as.data.frame()  %>% rownames_to_column("order") %>% arrange(desc(abs(PC2))) -> Top_PC
         #order,pos,len_seq,aa_seq,full.name
-        read_csv("Data/df_info_AT_v2_2_SZ_New.csv") %>% select(order, `full.name`) -> Annotation
+	#If annotation is to be added, include annotation file with `full.name` of the peptide. The peptide name is in the column `order`
+	Information_matrix="" #Path to information matrix
+        read_csv(Information_matrix %>% select(order, `full.name`) -> Annotation
         left_join(Top_PC, Annotation) -> Top_PC
+	#Checking PC2 because is linked with CMV peptides
         print("Top probes PC2")
         print(as_tibble(Top_PC))
         select(Top_PC, c(order, `full.name`)) %>% as_tibble() %>% head(n=10) %>% print()
 
 
-        #Do PCA
+        #Do PCA plot
 	if (is.null(Cluster)){
 		Get_clusters(as_tibble(First_100_PCs[,1:10])) -> Cluster_belonging
         } else { Cluster_belonging = Cluster ; print(Cluster_belonging) }
@@ -110,9 +114,9 @@ DO_PCA( filter(Data, Cohort == "32"), permanova=F) -> LLD_results
 PC_100 = LLD_results[[6]]
 Clusters = LLD_results[[7]]
 write_tsv(PC_100,"Results/Ordination/Top_100_PCs.tsv")
-
 write_tsv(Clusters,"Results/Ordination/Clusters.tsv")
-q()
+
+		 
 #LLD without CMV
 CMV = read_csv("Data/OLD/CMV_data.csv")
 CMV = colnames(CMV)[3:dim(CMV)[2]]
