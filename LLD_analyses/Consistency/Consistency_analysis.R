@@ -10,21 +10,21 @@ if (length(args) == 1){
 
 if (Prepare == T){
 	#Get data with followup
-	
-        Cov = read_tsv("Data/Covariates.tsv") #ID , sample_id
-        Data = readRDS("Data/Immuno_matrix_postSelection.rds") #read_tsv("../Data/Immuno_matrix_Alex.tsv") # ID "32_1039563132"
-
+	#Read file with metadata into Cov and matrix file in Data
+        Cov = read_tsv("") #ID , sample_id. 
+        Data = readRDS("") # ID "32_1039563132"
+	#Filtering of LLD samples (the only ones with Follow-up samples)
         Data %>% filter(grepl("32_", ID)) -> Data
+	#ID clean-up
         Data$ID = str_remove(Data$ID, '"')
         Data$ID = as.vector(sapply(Data$ID, FUN= function(x){ str_split(x, "_")[[1]][2] } ))
         Data$sample_id = Data$ID
         select(Data, -ID) -> Data
         print(Data)
-        #apply(select(Data, -sample_id) , 2, FUN = function(x){ x = as.numeric(x) ; sum(x, na.rm = T )/length(x)  } )  %>% as.data.frame() %>% rownames_to_column("Probe") -> D
-        #write_tsv(D, "Prevalence_antibodies_total.tsv")
+  	#Match datasets
         Cov %>% filter(sample_id %in% Data$sample_id) -> Cov
         left_join(Cov, Data, by = "sample_id") -> DD
-
+	#Add baseline/follow-up info 
         DD %>% filter(grepl("LL", ID)) -> DD
         DD %>% mutate(Time_point = ifelse(grepl("_F", ID), "FA", "BL")) -> DD
         DD$ID =  as.vector(sapply(DD$ID, FUN= function(x){ str_split(x, "_F")[[1]][1] } ))
@@ -34,19 +34,19 @@ if (Prepare == T){
 
         DD_FA %>% filter(ID %in% DD_BL$ID) -> DD_FA
         DD %>% filter( ID %in% DD_FA$ID) -> DD
-
-        saveRDS(DD, file = "Consitency_LLD/Data/Data_analysis.rds")
+	#Save data 
+        saveRDS(DD, file = "")
 }else{
-        # Restore the object
-        DD = readRDS(file = "Consitency_LLD/Data/Data_analysis.rds")
+        # Restore the object seved at the end of Prepare == T
+        DD = readRDS(file = "")
 }
 ##Add CMV info as covariate
-read_tsv("Data/Covariates_LLD&IBD.tsv") -> Cov
-read_tsv("Results/Ordination/Clusters.tsv") -> Clusters
+read_tsv("") -> Cov
+read_tsv("") -> Clusters #Information about CMV cluster based on PCA and k-means
 left_join(Cov, Clusters) %>% mutate(ID = Sample_name) %>% select(ID, Cluster) -> Clusters
 left_join(DD, Clusters) -> DD
 ##Add EBV info as covariate
-read_tsv("Data/EBV_clusters.txt") -> Clusters_EBV
+read_tsv("") -> Clusters_EBV #Info on EBV peptides (check script in Others)
 Clusters_EBV$ID = as.vector(sapply(Clusters_EBV$ID, FUN= function(x){ str_split(x, "_")[[1]][2] } ))
 left_join(Cov, Clusters_EBV) %>% mutate(ID = Sample_name) %>% select(ID, EBV_cluster) %>% mutate(EBV_cluster=1*EBV_cluster) -> Clusters_EBV
 left_join(DD, Clusters_EBV) -> DD
@@ -88,10 +88,7 @@ Prevalence_f= function(x, Thresh = 0.1){
 }
 
 AB_profile = select(DD, -c("ID", Names)) -> AB_profile
-#Keep_ab = apply(AB_profile, 2, FUN = Prevalence_f) #Appplied on samples with two time points
-#Keep_ab = colnames(AB_profile)[Keep_ab]
 
-#AB_profile %>% select(Keep_ab) -> AB_profile
 
 Get_distances = function(DD, Distance_matrix){
 	#Get distance between time points per sample pair belonging to same person
@@ -120,7 +117,7 @@ Distance_Consistency = function(Distance_matrix,DD, suffix=""){
 	#2. Use permutations to estimate significance
 	Permutations = 2000
 	Null_distribution = c()
-	#Loop where permutations happen and distances are obtaine. We use mean distance between permuted longitudinal samples to produce a null distribution
+	#Loop where permutations happen and distances are obtained. We use mean distance between permuted longitudinal samples to produce a null distribution
 	for (p in Permutations){
 		DD_p = DD
 		DD_p$ID = DD_p$ID[sample(nrow(DD_p)) ]
@@ -157,7 +154,6 @@ Distance_Consistency = function(Distance_matrix,DD, suffix=""){
 vegan::vegdist(AB_profile, method="jaccard", na.rm = T) -> Distance_matrix_jaccard
 Distance_Consistency(Distance_matrix_jaccard, DD)
 
-q()
 print("Boostrap analysis")
 set.seed(54)
 Boostrap_distances = list()
@@ -209,7 +205,6 @@ if (Prepare  == T){
                 Antibody_data2 = filter(Antibody_data, Time_point == "FA") %>% arrange(sample_id)
 
                 Antibody_data1 %>% mutate( BL = Antibody_data1$Anb , FA = Antibody_data2$Anb  ) %>% select(-c("Time_point", Anb)) ->Antibody_data_wide
-                #Antibody_data %>% spread("Time_point", Antibody) -> Antibody_data_wide
         
         
                 NA_rate_BL = sum(is.na(Antibody_data_wide$BL)) / dim(Antibody_data_wide)[1]
@@ -230,14 +225,14 @@ if (Prepare  == T){
 		        
                 Antibody_table = rbind(Antibody_table, N_T)     
 }
-        saveRDS(Antibody_table, file = "Consitency_LLD/Results/Antibody_consistency.rds")
+        saveRDS(Antibody_table, file = "Consistency/Results/Antibody_consistency.rds")
 
-} else { Antibody_table =  readRDS(file ="Consitency_LLD/Results/Antibody_consistency.rds")  }
+} else { Antibody_table =  readRDS(file ="Consistency/Results/Antibody_consistency.rds")  }
 
 Antibody_table %>% ggplot(aes(x=Consistency )) + geom_density() + theme_bw() -> Plot_consistency
 Antibody_table %>% group_by(Mean_change >= 0 ) %>% summarise(n()) %>% print()
-ggsave("Consitency_LLD/Results/Plots/Consistency_distribution.png", Plot_consistency)
-write_tsv(Antibody_table, "Consitency_LLD/Results/Consistency_by_ab.tsv") 
+ggsave("Consistency/Results/Plots/Consistency_distribution.png", Plot_consistency)
+write_tsv(Antibody_table, "Consistency/Results/Consistency_by_ab.tsv") 
 
 
 
