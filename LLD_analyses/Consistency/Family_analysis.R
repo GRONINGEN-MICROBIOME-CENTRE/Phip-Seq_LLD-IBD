@@ -4,9 +4,11 @@ library(ggforce)
 
 Prepare = F
 if (Prepare == T){
-        Cov = read_tsv("Data/Covariates.tsv") #ID , sample_id
-        Data = readRDS("Data/Immuno_matrix_postSelection.rds") # ID "32_1039563132"
-
+	#Metadata information
+        Cov = read_tsv("") #ID , sample_id
+	#Matrix of peptides information
+        Data = readRDS("") # ID "32_1039563132"
+	#Filtering LLD samples
         Data %>% filter(grepl("32_", ID)) -> Data
         Data$ID = str_remove(Data$ID, '"')
         Data$ID = as.vector(sapply(Data$ID, FUN= function(x){ str_split(x, "_")[[1]][2] } ))
@@ -19,17 +21,17 @@ if (Prepare == T){
 
         DD %>% filter( grepl("LL", ID)) -> DD
         
-		
-        GoNL_info = read_tsv("Data/GoNL_WGS_pedigree.tsv")
+	#Annotation of which sampoles belong to the Genome of The Netherlands study. Those samples are families	
+        GoNL_info = read_tsv("")
         colnames(GoNL_info)[1] = "ID"
         left_join(GoNL_info, DD) -> DD 
         print(DD)
-        saveRDS(DD, file = "Family_comparison/Data/Data_analysis.rds")
+        saveRDS(DD, file = "")
 } else{
 	print("Reading")
-        DD = readRDS(file = "Family_comparison/Data/Data_analysis.rds")
+        DD = readRDS(file = "")
 }
-
+#Colors for plot
 c25 <- c("dodgerblue2", "#E31A1C", "green4","#6A3D9A", "#FF7F00", "black", "gold1", "skyblue2", "#FB9A99", "palegreen2","#CAB2D6", "#FDBF6F", "gray70", "khaki2",
          "maroon", "orchid1", "deeppink1", "blue1", "steelblue4","darkturquoise", "green1", "yellow4", "yellow3","darkorange4", "brown")
 
@@ -46,8 +48,8 @@ Family = remove_l(DD$WGS_id)
 DD %>% mutate(Fam = Family) -> DD
 
 ##ADD CMV clusters info
-read_tsv("Data/Covariates_LLD&IBD.tsv") -> Cov
-read_tsv("Results/Ordination/Clusters.tsv") -> Clusters
+read_tsv("") -> Cov
+read_tsv("") -> Clusters
 left_join(Cov, Clusters) %>% mutate(ID = Sample_name) %>% select(ID, Cluster) -> Clusters
 left_join(DD, Clusters) -> DD
 
