@@ -5,9 +5,10 @@ library(patchwork)
 library(stats)
 library(viridis)
 
-#Compute PCA, permanova and some other stats
 
-Data = readRDS(file = "Data/Immuno_matrix_postSelection.rds") #generated in 01
+#Data and covariates reading
+Data = readRDS(file = "Data/Immuno_matrix_postSelection.rds")
+#Removal of samples that belong to CeD cohort
 Cohort = sapply(Data$ID, function(x){ str_split(x, "_")[[1]][1] } ) %>% as_vector() -> cohorts
 Data %>% mutate(Cohort = cohorts) %>% filter(!Cohort == "34") -> Data
 set.seed(99)
@@ -20,11 +21,12 @@ Get_clusters = function(Data){
 
 
 #Create function to do PCA and extract eigen values / eigen vectors
-DO_PCA = function(Data, permanova=F){
+DO_PCA = function(Data, permanova=F, Cluster=NULL){
         Data %>% select(-Cohort) -> Data
         sapply(Data$ID, function(x){ str_split(x, "_")[[1]][2] }) -> New_ID
         Data$ID = New_ID
-        Covariates = read_tsv("") #Read covariate file
+        Covariates = read_tsv("Data/Covariates_LLD&IBD.tsv")
+	#Remove Followup samples
 	Covariates %>% filter(!grepl("F", Sample_name)) -> Covariates
         Covariates %>% filter(ID %in% Data$ID ) -> Covariates
         Covariates %>% drop_na() -> Covariates
@@ -60,7 +62,7 @@ DO_PCA = function(Data, permanova=F){
         Scree_input %>% filter(`Cumulative Proportion` >= 0.9) %>% head(1) -> Min_PC
 
         #Check major contributors of PCs
-        PCA_s$species %>% as.data.frame()  %>% rownames_to_column("order") %>% arrange(desc(abs(PC2))) -> Top_PC
+        scores(PCA,seq(100))$species %>% as.data.frame()  %>% rownames_to_column("order") %>% arrange(desc(abs(PC2))) -> Top_PC
         #order,pos,len_seq,aa_seq,full.name
         read_csv("Data/df_info_AT_v2_2_SZ_New.csv") %>% select(order, `full.name`) -> Annotation
         left_join(Top_PC, Annotation) -> Top_PC
@@ -70,16 +72,17 @@ DO_PCA = function(Data, permanova=F){
 
 
         #Do PCA
-	
-	Get_clusters(as_tibble(First_100_PCs[,1:10])) -> Cluster_belonging
-        PCs %>% as_tibble() %>%  mutate(Cluster = as.factor(Cluster_belonging)) %>%
+	if (is.null(Cluster)){
+		Get_clusters(as_tibble(First_100_PCs[,1:10])) -> Cluster_belonging
+        } else { Cluster_belonging = Cluster ; print(Cluster_belonging) }
+	PCs %>% as_tibble() %>%  mutate(Cluster = as.factor(Cluster_belonging)) %>%
         ggplot() + geom_point(aes(x=PC1, y=PC2, col=Cluster)) + theme_bw() + xlab(paste(c("PC1(", as.character(round(Variance_per_axis[1], 2)), "%)"), collapse="")) + ylab(paste(c("PC2(", as.character(round(Variance_per_axis[2], 2)), "%)"), collapse="")) +  scale_color_manual(values = c("#440154FF","#21908CFF") )  -> PCA_plot
-
+	Cluster_belonging = tibble(ID = First_100_PCs$ID, Cluster = Cluster_belonging)
 
 	#Do PERMANOVA
 	if ( permanova == T){
 	PCs %>% as_tibble() %>%  mutate(Cluster = as.factor(Cluster_belonging)) -> Input_PCA
-	
+	saveRDS(Input_PCA, "Input_figures/Figure_1C.rds")
 	print("computing distance")
 	Distance = vegdist( Data2 , method="jaccard")
 	print("permanova")
@@ -91,7 +94,7 @@ DO_PCA = function(Data, permanova=F){
 	print(permanova)
 	}
 	Component_importance =  as.data.frame(PCA_s$cont$importance) %>% rownames_to_column("Legend") %>% as_tibble()
-        return( list(PCA_plot, Min_PC, Scree_plot, Top_PC, Component_importance, First_100_PCs) )
+        return( list(PCA_plot, Min_PC, Scree_plot, Top_PC, Component_importance, First_100_PCs, Cluster_belonging) )
 
 }
 
@@ -103,17 +106,26 @@ print("Variance explained by first two components")
 Overall_results[[5]][,1:2] %>% print()
 
 print("LLD")
-DO_PCA( filter(Data, Cohort == "32"), permanova=T) -> LLD_results
+DO_PCA( filter(Data, Cohort == "32"), permanova=F) -> LLD_results
+PC_100 = LLD_results[[6]]
+Clusters = LLD_results[[7]]
+write_tsv(PC_100,"Results/Ordination/Top_100_PCs.tsv")
+
+write_tsv(Clusters,"Results/Ordination/Clusters.tsv")
+q()
 #LLD without CMV
-CMV = read_csv("/") #File with information about CMV probes
+CMV = read_csv("Data/OLD/CMV_data.csv")
 CMV = colnames(CMV)[3:dim(CMV)[2]]
 Subset = select(Data, -one_of(CMV))
-DO_PCA( filter(Subset, Cohort == "32"),  permanova=F) -> LLD_results_noCMV
-
+print(Clusters)
+DO_PCA( filter(Subset, Cohort == "32"),  permanova=F, Cluster = Clusters$Cluster) -> LLD_results_noCMV
+ggsave("Results/Ordination/PCA_LLD_noCMV.pdf", LLD_results_noCMV[[1]])
 print("IBD")
 DO_PCA( filter(Data, Cohort == "33") ) -> IBD_results
 
 #Save PCA, Min_number of PCs, scree plot and Top probes for PC1
+SAVE = T
+if (SAVE == T){
 #1. PCA
 ggsave("Results/Ordination/PCA_LLD.pdf", LLD_results[[1]])
 ggsave("Results/Ordination/PCA_IBD.pdf", IBD_results[[1]])
@@ -131,8 +143,10 @@ ggsave("Results/Ordination/Scree_LLD&IBD.pdf", Overall_results[[3]])
 write_tsv(Overall_results[[4]],"Results/Ordination/Top_loads_LLD&IBD.tsv")
 write_tsv(LLD_results[[4]],"Results/Ordination/Top_loads_LLD.tsv")
 write_tsv(IBD_results[[4]],"Results/Ordination/Top_loads_IBD.tsv")
-
+write_tsv(LLD_results_noCMV[[4]], "Results/Ordination/Top_loads_LLD_noCMV.tsv")
+}
 Overall_results[[6]] -> First_100_PCs
+write_tsv( as_tibble(First_100_PCs), "Results/Ordination/LLD_PCA")
 colnames(First_100_PCs)[grepl("PC", colnames(First_100_PCs))] -> PC_names
 PC_association = tibble()
 for (PC in PC_names){
