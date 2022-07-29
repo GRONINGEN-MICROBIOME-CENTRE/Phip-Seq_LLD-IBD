@@ -918,7 +918,10 @@ Similarity_cluster %>% filter(P_mantel>0.05)
 write_tsv(Similarity_cluster,path = "Similarity_scores.tsv")
 
 
-#New figure 2
+
+##################################
+#########Figure 2, Heatmap########
+##################################
 Data %>% select( c("ID", Groups_LLD3$Probe) ) %>% select( -ID ) %>% cor() -> Corr_Matrix_Modules
 left_join( Network_labels, select(mutate(Annotation_groups, Name = Probe), c(Name, Cluster, High_taxonomy) )  ) -> Network_labels
 Network_labels %>% mutate(Cluster = as.factor(Cluster)) %>% as.data.frame() %>% column_to_rownames("Name") %>% select(-Color) -> Annotation_heatmap
@@ -928,7 +931,6 @@ names(annotation_colors) = unique(Network_labels$Cluster)
 
 annotation_colors2 = Colors_do[1: length(unique(Network_labels$High_taxonomy)) ]
 names(annotation_colors2) = sort(unique(Network_labels$High_taxonomy))
-
 
 list(  Cluster = annotation_colors, High_taxonomy= annotation_colors2  ) -> annotation_colors
 pheatmap::pheatmap(Corr_Matrix_Modules, annotation_row = Annotation_heatmap, annotation_colors =  annotation_colors, labels_row = rep("", nrow(Corr_Matrix_Modules) ) , labels_col = rep("", nrow(Corr_Matrix_Modules) ) )
