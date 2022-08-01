@@ -26,12 +26,21 @@ Check_prevalence(Peptides, Samples, Selection)
 #Do a selection
 set.seed(20)
 Peptides %>% filter(ID %in% Samples)  %>% filter(twist_15595 == 1) %>% select(ID) -> For_experiment_enrich
+Choices = tibble()
 for ( i in c(16, 21, 31, 41)){
   sample(Samples, i) -> For_experiment
   For_experiment = c(For_experiment, For_experiment_enrich$ID)
   length(For_experiment)
   Check_prevalence(Peptides, For_experiment, Selection)
+  rbind(Choices, tibble(ID = For_experiment, N=length(For_experiment) )) -> Choices
 }
+Choices %>% filter(N==40) -> Choice
+Covariates %>% mutate( ID_LLD = ID, ID = paste0("32_", sample_id, join="") ) %>% select(ID, ID_LLD) %>%
+  left_join(Choice, .) %>% View()
+
+
+
+
 
 ################################################################################################################################################
 ##### Check Null Distributions of correlation / Similarity to assess how many matches we need to find statistical significance##################
@@ -125,5 +134,7 @@ print(Similarities)
 #6       0.840      0.75      6      0           0      
 #7       0.921      0.875     7      0           0      
 #8       1          1         8      0           0      
+
+
 
 
