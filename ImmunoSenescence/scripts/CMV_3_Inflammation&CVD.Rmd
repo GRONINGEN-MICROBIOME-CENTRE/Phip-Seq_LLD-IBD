@@ -1,0 +1,463 @@
+---
+title: "3_CMV_Inflamamtion"
+author: "Sergio Andreu-Sanchez"
+date: "5/23/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## CMV Omics - Script 3: CMV effects in cytokine production and pro-CVD markers
+
+*R Markdown* of third script. Read data of LLD CMV seropositivity predictions (from script 1), blood cytokines/adipokines and CVD proteomics panel.
+
+
+```{r libraries, message=FALSE, warning=FALSE, results='hide'}
+Location_dir = "~/Documents/GitHub/CMV_Associations/"
+
+library(MASS) #For LDA_function
+library(tidyverse)
+library(caret) #For RF_function
+library(MetBrewer)
+library(pROC)
+library(glmnet)
+library(glmnetUtils) 
+library(patchwork)
+library(ggrepel)
+library(ggforce)
+library(readxl)
+
+
+source(paste0(Location_dir,"scripts/Functions.R"))
+source(paste0(Location_dir,"scripts/Functions_multivariate.R"))
+```
+
+Open data and process.
+1. Covariates including CMV prediction
+2. Cytokines/Adipokines
+3. Proteomics CVD OLINK panel
+4. Cell predictions (CLR/ALR transform and PCA for dimensionality reduction)
+
+
+```{r Read data,  message=FALSE, warning=FALSE, results='hide'}
+#CMV predictions
+Covariates = read_tsv(paste0(Location_dir,"Results/LLD_CMV_profile.tsv")) %>% filter(TimePoint == "Baseline")
+#Cytokines
+Phenotypes <- read_delim(paste0(Location_dir,"Data/Merged_Phenotypes_LLD.csv"), delim="|")
+Phenotypes %>% dplyr::select(ID,Citrullin, IL.1.Beta, IL.6, IL.8, IL.10, IL.12P70, `IL-18`, `IL-18bpx`, TNF.Alpha, `Leptin `, Resistin, `Adiponectin `, `AAT `, `hs-CRP`) %>% drop_na() %>% rename ( "IL_18" = `IL-18` , "AAT"=`AAT `, "Adiponectin"=`Adiponectin `, "Leptin"=`Leptin `, "hsCRP"=`hs-CRP`, "IL_18bpx" =`IL-18bpx`) -> Cytokines
+#Proteomics uncorrected
+read_tsv(paste0(Location_dir,"Data/CVD3_olinkNormal_1447_LLDsamples_t_ProtNames.txt")) -> Proteomics
+Proteomics %>% t() %>% as.data.frame() %>%  rownames_to_column("ID") %>% as_tibble() %>% filter(!ID == "Protein") %>% `colnames<-`(c("ID", Proteomics$Protein))  -> Proteomics
+Proteomics %>% select(-CCL22) -> Proteomics
+
+#Cell predictions
+all_cell_types = read_tsv(paste0(Location_dir,"Data/BIOS_cell_types_DeconCell_2019-03-08.LLD_subset.txt")) -> all_cell_types
+#format
+all_cell_types %>% gather(key = var_name, value = value, 2:ncol(all_cell_types)) %>% spread_(key = names(all_cell_types)[1],value = 'value') %>% rename(ID = var_name) -> all_cell_types
+# negative values to 0, recalculate to 100 and ALR transformation using monocytes as denominator
+Clean_and_ALR(all_cell_types) -> cell_matrix_alr
+Clean_and_CLR(all_cell_types) -> cell_matrix_clr
+cell_matrix_xlr = cell_matrix_clr
+
+# logs of 0 give infinite, make NA and remove samples
+cell_matrix_xlr[sapply(cell_matrix_xlr, is.infinite)] <- NA
+cell_matrix_xlr %>% drop_na() -> cell_matrix_xlr
+#Make a PCA to control for cell composition
+res.pca <- prcomp(dplyr::select(cell_matrix_xlr,-ID), scale = TRUE)
+Variability = 100* (res.pca$sdev/sum(res.pca$sdev))
+PCs = as_tibble(res.pca$x) %>% mutate(ID = cell_matrix_xlr$ID)
+PCs %>% dplyr::select(c(ID, PC1, PC2,PC3,PC4,PC5,PC6,PC7,PC8,PC9,PC10)) -> Top_PCs
+```
+
+
+
+```{r Some helper functions}
+#Null: denominator uses the null distribution to estimate discoveries
+Compute_FDR_null =  function(P, Permutation_results,fdr_threshold = 0.05 ){
+  # calculate FDR for each observed P-value
+  fdr_values <- sapply(P, function(p) {
+    # count number of false positives (i.e., permuted P < observed P)
+    false_positives <- sum(Permutation_results <= p)
+    # calculate FDR
+    fdr <- false_positives / sum(Permutation_results <= fdr_threshold)
+    # ensure FDR is between 0 and 1
+    fdr <- ifelse(fdr < 0, 0, ifelse(fdr > 1, 1, fdr))
+    return(fdr)
+  })
+  return(fdr_values)
+} 
+#FDR2: Denominator uses the number of discoveries in real P. N FD is corrected by the number of permutations
+Compute_FDR2 =  function(P, Permutation_results,Permutations = 100 ){
+  Order = order(P)
+  tibble(Position = Order, FDR = NA) -> values
+  fdr_values = c()
+  for ( i in seq(P) ){
+    Threshold = P[which(Order == i)]
+    FDR_v = sum(Permutation_results <= Threshold) / Permutations / i
+    if (FDR_v > 1 ){ FDR_v = 1 }
+    values %>% mutate(FDR = ifelse(Position == i, FDR_v, FDR  )) -> values
+  }
+  return(values$FDR)
+}  
+Basic_association2 = function(DF=For_association, Cyto=Cytokines, Cell_count_correction=T){
+  Cyto_association = tibble()
+  for (C in colnames(Cyto)){
+      if (C ==  "ID"){ next }
+      if (Cell_count_correction == F){
+        Formula = as.formula(paste0(C, " ~ Age+Sex+CMV_prediction"  ) )
+      } else {
+        Formula = as.formula(paste0(C, " ~ Age+Sex+CMV_prediction+PC1+PC2+PC3+PC4+PC5+PC6+PC7+PC8+PC10"  ) )
+      }
+      lm(Formula,DF) -> M
+      M %>% summary() -> S
+      S$coefficients["CMV_prediction",] %>% t() %>% as_tibble() %>% mutate(Cytokine = C, Sample_n = length(M$residuals)) -> S
+      Cyto_association = rbind(Cyto_association, S)
+}
+ return(Cyto_association) 
+}  
+
+```
+
+Cytokines analyses.
+Check distribution of cytokines. Identify if log10 is needed to reduce distance. Observe if 0 inflation is a problem.
+Association with CMV status (linear model). Permutations to estimate FDR.
+
+```{r Explore cytokine distributions and association,  message=FALSE, warning=FALSE}
+
+Cytokines %>% gather(Cytokine, Concentration ,2:dim(Cytokines)[2]) %>% ggplot(aes(x= log10(Concentration) )) + geom_histogram() + theme_bw() + facet_wrap(~Cytokine, scales="free")
+
+set.seed(76)
+
+Cytokines %>% dplyr::select(-ID) %>% apply(2,log10) %>% as_tibble() %>% apply(2, function(x){ x[x==min(x)] = NA ; return(x) } )  %>% as_tibble() %>% mutate(ID = Cytokines$ID) -> Add_cytokines
+left_join( dplyr::select(Covariates, c(ID, Age, Sex, CMV_prediction)) , Add_cytokines, by="ID") -> For_association
+left_join(For_association, Top_PCs, by="ID") -> For_association #If cell count correction is wanted
+For_association[sapply(For_association, is.infinite)] <- NA
+
+
+Permutations_3 = function( F_A, Cyto, Real_P, N_Permutations=100 ){
+  #We will calculate FDR values through permutation
+  Null_distribution = c()
+  for (Permutation_n in seq(N_Permutations) ){
+    #print( paste0("Permutation: ", Permutation_n ) )
+    
+    F_A_permuted = F_A
+    F_A_permuted$CMV_prediction =  sample(F_A_permuted$CMV_prediction, size = dim(F_A_permuted)[1], replace=F )
+
+    Basic_association2(F_A_permuted, Cyto)  -> Permuted_results
+    Null_distribution = c(Null_distribution, Permuted_results$`Pr(>|t|)`)
+  }
+  
+  FDRs = Compute_FDR2(Real_P, Null_distribution , N_Permutations)
+  
+  return(FDRs)
+}
+
+
+Basic_association2(For_association, Cytokines) %>% arrange(`Pr(>|t|)`) -> Cyto_association
+Permutations_3(For_association, Add_cytokines, Cyto_association$`Pr(>|t|)`, 1000) -> FDR_p
+Cyto_association %>% mutate(FDR_perm = FDR_p) -> Cyto_association
+print(Cyto_association)
+
+
+write_tsv(Cyto_association, paste0(Location_dir, "Results/CMV_Cytokines.tsv"))
+
+```
+Residuals of 0-inflated distributions dont look fine. I believe we might be seing some lower limit detention problems (min of TNF-alpha is 0.16 in many samples, 0.21 for IL.1.Beta ...). 
+
+
+We find that CMV infection is significantly associated with higher levels of IL_18BP (0.0409, P=0.00166, FDR_bh=0.0232, FDR_1000=0.031). Tolerogenic response. This cytokine's distribution looks ok.
+
+Next, we will explore the OLINK CVD proteomic panel.
+
+```{r Explore proteomics distributions,  message=FALSE, warning=FALSE}
+
+###PREPARE DATA #####
+#Olink data is already log10 transformed
+Proteomics %>% dplyr::select(-ID) %>% apply(2, function(x){ as.numeric(x) } ) %>% as_tibble() %>% mutate(ID = Proteomics$ID) %>% left_join(dplyr::select(Covariates, c(ID, CMV_prediction, Age, Sex)) , .) %>% drop_na()  -> DF_p_uncorrected
+
+
+#Not-adjusted data
+DF_p_uncorrected[sapply(DF_p_uncorrected, is.infinite)] <- NA
+DF_p_uncorrected %>% drop_na() -> DF_p_uncorrected
+DF_p_uncorrected %>% dplyr::select(-c(CMV_prediction, Sex, ID)) %>% apply(2, scale) %>% as_tibble() %>% mutate(CMV_prediction = DF_p_uncorrected$CMV_prediction, Sex= DF_p_uncorrected$Sex, ID=DF_p_uncorrected$ID) -> DF_p_uncorrected
+Saved_IDs_un = DF_p_uncorrected$ID
+#Add cell composition covariates
+left_join(DF_p_uncorrected, Top_PCs) %>% dplyr::select(-ID) %>% drop_na() -> DF_p_uncorrected_PCs
+DF_p_uncorrected %>% dplyr::select(-ID) -> DF_p_uncorrected
+
+DF_p_uncorrected %>% select(-c(Age, Sex, CMV_prediction)) %>% gather(Protein, Concentration) %>% ggplot(aes(x=Concentration)) + geom_histogram() + theme_bw() + facet_wrap(~Protein)
+
+DF_p_uncorrected  %>% mutate(CMV_prediction = as.numeric(CMV_prediction)) %>% cor() -> For_plot
+For_plot %>% pheatmap::pheatmap(labels_row = make_bold_names(For_plot, rownames, c("CMV_prediction")), labels_col = make_bold_names(For_plot, colnames, c("CMV_prediction") ), color = met.brewer(name="Cassatt2", type="continuous") )
+```
+
+
+```{r Association proteomics,  message=FALSE, warning=FALSE}
+
+Assoc_Protein = function(DF = DF_p, Covariates_u = F ){
+  Association_proteomics = tibble()
+  for (Protein in  colnames(DF) ){
+    if (Protein %in% c("ID", "Sex", "Age", "CMV_prediction")){ next }
+    if (Covariates_u == T){
+      Formula = as.formula( paste0("`", Protein, "` ~ Age + Sex + CMV_prediction" ) )
+    } else { 
+      Formula = as.formula( paste0("`", Protein, "` ~ CMV_prediction" ) )
+    }
+    lm(Formula, DF) %>% summary() -> temp_result
+    temp_result$coefficients %>% as_tibble() %>% tail(1) %>%   mutate(Protein = Protein) -> temp_result
+    rbind(Association_proteomics, temp_result) -> Association_proteomics
+  }
+  return(Association_proteomics)
+}
+Get_Permutation_FDR = function(Assocation_proteomics,DF, Permutations=100, Use_covariate=F){
+  set.seed(87)
+  N_perm = Permutations
+  Permuted_ps = c()
+  for (Permutation in 1:N_perm){
+    Permuted_cmv = sample(DF$CMV_prediction, replace=F, size = dim(DF)[1] ) 
+     Permuted = Assoc_Protein(mutate(DF, CMV_prediction=Permuted_cmv ), Covariates_u=Use_covariate)
+    Permuted_ps = c(Permuted_ps, Permuted$`Pr(>|t|)`)
+  }
+
+  FDR = Compute_FDR2(Association_proteomics$`Pr(>|t|)`, Permuted_ps , Permutations)
+  Association_proteomics %>% mutate(FDR_permutation = FDR) %>% arrange(`Pr(>|t|)`) -> Association_proteomics
+  return(Association_proteomics)
+}
+
+#Assocations
+Association_proteomics = Assoc_Protein(DF_p_uncorrected, Covariates_u = T   )
+#Get FDR
+Association_proteomics = Get_Permutation_FDR(Association_proteomics,DF_p_uncorrected, Permutations = 1000)
+#Plotting volcano plot
+Association_proteomics %>% ggplot(aes(x=Estimate, y=-log10(`Pr(>|t|)` ), col = `Pr(>|t|)`<0.05 )) + geom_point() +theme_bw() + scale_color_discrete(type = met.brewer(name="Klimt", n=2,type="discrete") )
+print(Association_proteomics)
+
+write_tsv(Association_proteomics, paste0(Location_dir, "Results/CMV_Olink.tsv"))
+
+```
+No significant findings with Olink proteins
+
+Are there Age-dependent differences in CMV effects on proteomics?
+
+Age different effects of CMV in protein levels
+```{r Interaction age and CMV }
+#Add variable to dataset with different age bins
+Covariates %>% mutate(Age_group = ifelse(Age < 30, "Twenties", ifelse(Age<40, "Thirties", ifelse(Age<50, "Fourties", ifelse(Age<60, "Fifties", ifelse(Age<70, "Sixties", ifelse(Age<80, "Seventies", NA) ) ) )  )  ) ) -> Covariates
+  Covariates %>% mutate(Age_group = factor(Age_group, levels = c("Twenties", "Thirties", "Fourties", "Fifties", "Sixties", "Seventies" ) ) ) -> Covariates
+#Add second variable indicating if young (twenties) or elder (seventies)
+Covariates %>% mutate(Age_group2 = ifelse(Age_group %in% c("Twenties", "Seventies"), as.factor(Age_group), NA ) ) -> Covariates
+
+
+
+#Function for interaction assocaiton
+Interaction_age = function(DF_test){
+  Age_CMV = tibble()
+  N = colnames(DF_test)[colnames(DF_test) %in% colnames(Proteomics) ]
+  for (i in N ){
+    if (i == "ID"){ next }
+    Model = paste0("`",i, "` ~ Sex + Age_group2*CMV_prediction")
+    Model0 = paste0("`", i, "` ~ Sex + Age_group2 + CMV_prediction")
+    lm(Model, DF_test) -> Model1
+    lm(Model0, DF_test) -> Model0
+    anova(Model0, Model1) -> A
+    tibble(Protein=i , P=  A$`Pr(>F)`) %>% rbind(Age_CMV, . ) ->  Age_CMV
+  }
+  return(Age_CMV)
+}
+
+set.seed(78789)
+Age_CMV = Interaction_age(left_join(Proteomics, Covariates )) %>% drop_na() 
+#Perfomr permutations
+Permutation_results = tibble()
+N_perm = 1000
+for (i in seq(N_perm)){
+  Covariates_perm = Covariates 
+  
+  Covariates_perm$CMV_prediction =  sample(Covariates_perm$CMV_prediction, dim(Covariates_perm)[1], replace=T )
+  Covariates_perm$Age_group2 =  sample(Covariates_perm$Age_group2, dim(Covariates_perm)[1], replace=T )
+  
+  Interaction_age(left_join(Proteomics, Covariates_perm, by="ID" ))  %>% drop_na()  %>% rbind(Permutation_results, . ) -> Permutation_results
+}
+FDRs = Compute_FDR2(Age_CMV$P, Permutation_results , N_perm)
+Age_CMV %>% mutate(FDR_p = FDRs) %>% arrange(P) -> Age_CMV
+
+#Get effect size for the signifcant assocaiton
+lm(`PSP-D` ~ Sex+as.factor(Age_group2)*CMV_prediction, left_join(Proteomics, Covariates ) ) %>% summary()
+
+#Plot
+ left_join(Proteomics, Covariates ) %>% filter(!is.na(CMV_prediction)) %>% filter(! is.na(Age_group)) %>% ggplot( aes(x=as.factor(CMV_prediction) ,y= as.numeric(`PSP-D`)  ) )  + geom_boxplot(outlier.shape = NA) + ggforce::geom_sina(alpha=0.3)  + facet_wrap(~Age_group) + theme_bw()
+ left_join(Proteomics, Covariates ) %>% lm(`PSP-D` ~ Sex + Age_group*CMV_prediction, .  ) %>% summary()
+
+write_tsv(Age_CMV, paste0(Location_dir, "Results/CMV_age_interaction_Olink.tsv"))
+
+```
+
+
+Next, we will investigate the reasons Females have shorter telomeres. This might be related to a stronger response to CMV. Thus we will check: 1. Do females have more proinflammatory proteins than males when infected?  2. Do females have higher antibody titters?
+
+
+Females TL are more affected by CMV. We wonder if at the cytokine level we also see different effects in females.
+
+```{r Interaction effect of CMV and cytokines levels}
+
+
+Interaction_association = function(For_association_cytokines){
+  Interaction_results = tibble()
+  for (Cyto in colnames(dplyr::select(Cytokines, -ID ))){
+    Model = paste0("`",Cyto ,"` ~ CMV_prediction + Age + Sex + CMV_prediction:Sex")
+    lm(Model, For_association_cytokines) %>% summary() -> Interaction_results_temp
+    Interaction_results_temp$coefficients %>% as.data.frame() %>% rownames_to_column("Effect") %>% mutate(Cytokine = Cyto) %>% rbind(Interaction_results, . ) -> Interaction_results 
+  }
+  return(Interaction_results)
+}
+
+#1. 
+left_join(Covariates, Cytokines) -> For_association_cytokines
+Interaction_association(For_association_cytokines) ->  Interaction_results
+#2. Ranking cytokine levels
+For_association_cytokines_rank  = left_join(Covariates, Cytokines %>% dplyr::select(-ID) %>% apply(2, InvRank) %>% as_tibble() %>% mutate(ID = Cytokines$ID) )
+Interaction_association( For_association_cytokines_rank ) -> Interaction_results_rank
+#3. Permutation-based FDR
+Do_permutations = function(Interaction_results, shuffle="CMV_and_sex", N_perm=1000){
+  set.seed(8744)
+  Result_permutation = tibble()
+  for ( i in seq(1:N_perm) ){
+    print(paste0("Permutation: ", i ))
+    Covariates_perm= Covariates
+    if (shuffle == "CMV") {
+      sample(c(1,0), replace=T , 1448) -> NID
+      Covariates_perm$CMV_prediction = NID
+    } else if (shuffle == "CMV_and_sex") {
+      sample(Covariates_perm$CMV_prediction, replace=T , 1448) -> NID
+      sample(Covariates_perm$Sex, replace=T , 1448) -> NID2
+      Covariates_perm$CMV_prediction = NID
+      Covariates_perm$Sex = NID2
+    }
+    Interaction_association(left_join(Covariates_perm, Cytokines, by="ID")) %>% rbind(Result_permutation, . ) -> Result_permutation
+    
+  }
+  Result_permutation %>% filter(grepl(":", Effect)) -> Result_permutation
+  #Result_permutation %>% ggplot(aes(x=`Pr(>|t|)` )) + geom_histogram() + theme_bw() + facet_wrap(~Cytokine) 
+  
+  # calculate FDR for each observed P-value
+  FDRs = Compute_FDR2(Interaction_results$`Pr(>|t|)`, Result_permutation$`Pr(>|t|)` , N_perm)
+  return(Interaction_results %>% mutate(FDR_p = FDRs))
+}  
+  
+#Results using the rank-based approach  
+Interaction_results_rank %>% filter(grepl(":", Effect)) -> Interaction_results_rank
+Do_permutations(Interaction_results_rank, N_perm = 1000 )  -> Interaction_results_rank
+Interaction_results_rank %>% mutate(Model = "Rank") %>% as_tibble() %>% arrange(`Pr(>|t|)` ) -> Interaction_results_rank
+#Results without rank          
+Interaction_results %>% filter(grepl(":", Effect)) -> Interaction_results
+Do_permutations(Interaction_results ) -> Interaction_results
+Interaction_results %>% mutate(Model = "Rank") %>% as_tibble() %>% arrange(`Pr(>|t|)` )  -> Interaction_results
+#Combine both
+left_join(Interaction_results_rank %>% select(-Model),Interaction_results %>% select(-Model) , by=c("Effect","Cytokine"), suffix=c("_rankedCytokine","")  ) %>% arrange(`Pr(>|t|)_rankedCytokine`) -> For_Save
+rbind(Interaction_results_rank,Interaction_results )  -> Interaction_results_all
+#Save
+For_Save  %>% write_tsv(. , path = paste0(Location_dir, "Results/CMV_cytokine_sex_interaction.tsv"))
+
+#Volcano plot
+Interaction_results_all %>% filter(Model=="Rank") %>% ggplot(aes(x=Estimate, y=-log10(`Pr(>|t|)`), col = FDR_p<0.05 )) + geom_point() + theme_bw() + geom_vline(xintercept = 0) + geom_hline(yintercept = -log10(0.05), linetype=2) +scale_color_manual(values = c(met.brewer(name="Klimt", n=2,type="discrete")) ) #+ facet_wrap(~Model, scales = "free")
+
+#Plots sex dependent assocaiton
+#Prepare data
+For_association_cytokines %>% mutate(Sex_and_status = ifelse(CMV_prediction==1 & Sex ==2, "Female positive", ifelse(CMV_prediction==1 & Sex==1, "Male positive", ifelse(CMV_prediction==0 & Sex==2, "Female negative", "Male negative") ) ) ) -> For_plot
+left_join(Covariates, Cytokines %>% select(-ID) %>% apply(2, InvRank) %>% as_tibble() %>% mutate(ID = Cytokines$ID) )  %>% mutate(Sex_and_status = ifelse(CMV_prediction==1 & Sex ==2, "Female positive", ifelse(CMV_prediction==1 & Sex==1, "Male positive", ifelse(CMV_prediction==0 & Sex==2, "Female negative", "Male negative") ) ) ) -> For_plot2
+#plot
+For_plot %>% filter(!is.na(Sex_and_status)) %>% filter(`IL.1.Beta` >0.5) %>%  ggplot(aes(x= as.factor(Sex_and_status) , y = log10(`IL.1.Beta`) )) + geom_boxplot() + theme_bw() + ggforce::geom_sina()
+For_plot2 %>% filter(!is.na(Sex_and_status)) %>% filter(`IL.6` > 0) %>%  ggplot(aes(x= as.factor(Sex_and_status) , y = `IL.6`) ) + geom_boxplot() + theme_bw() + ggforce::geom_sina()+ coord_flip() +  theme(axis.title.y=element_blank() ) -> Il6_int
+For_plot2 %>% filter(!is.na(Sex_and_status)) %>% filter(`IL.12P70` > 0) %>%  ggplot(aes(x= as.factor(Sex_and_status) , y = `IL.12P70`) ) + geom_boxplot() + theme_bw() + ggforce::geom_sina() + coord_flip() +  theme(axis.title.y=element_blank() )  -> IL12P70_int
+
+Il6_int | IL12P70_int -> cytokine_plots
+ggsave( paste0(Location_dir,"Results/Figures/Sex_cytokine_CMV.pdf"), cytokine_plots)
+
+
+For_plot2 %>% filter(`IL.12P70` > 0) %>% lm(`IL.12P70` ~ Age + CMV_prediction*Sex, . ) %>% summary()
+
+
+lm(`IL.12P70` ~ Age + CMV_prediction ,For_association_cytokines_rank %>% filter(Sex==1)  ) %>% summary()
+lm(`IL.12P70` ~ Age + CMV_prediction ,For_association_cytokines_rank %>% filter(Sex==2)  ) %>% summary()
+
+lm(`IL.6` ~ Age + CMV_prediction ,For_association_cytokines_rank %>% filter(Sex==1) ) %>% summary()
+lm(`IL.6` ~ Age + CMV_prediction ,For_association_cytokines_rank %>% filter(Sex==2) ) %>% summary()
+
+```
+
+There are two significant results if rank, none if not ranked.
+
+
+Do females also show higher levels of CMV titters than males?
+
+```{r Differences in titters between sexes}
+  All_alr = read_rds( paste0(Location_dir,"Data/Quantifiaction_PhIPseq_alr.rds") )
+  cmv_peptides <- read_tsv(paste0(Location_dir, "Results/CMV_peptides.tsv"))
+  cmv_peptides <- cmv_peptides$Peptide
+
+
+  All_alr %>% filter(grepl("LLD", ID)) %>% filter(! grepl("_F", ID) ) -> All_alr
+  All_alr %>% filter(ID %in% filter(Covariates, CMV_prediction == 1)$ID ) %>% dplyr::select(c("ID", cmv_peptides)) -> Titters
+  
+  Titters %>% left_join(Covariates %>% select(ID, Sex, Age )) -> Titters_test
+  Association_titters = tibble()
+  for (Peptide in colnames(Titters)){
+    if (Peptide == "ID"){ next }
+    Model = paste0(Peptide, " ~ Sex + Age")
+    lm(Model, Titters_test) %>% summary() -> Model
+    Model$coefficients %>% as.data.frame() %>% rownames_to_column("Value") %>% filter(Value == "Sex") %>% dplyr::select(-Value) %>% as_tibble() %>% mutate(Peptide = Peptide) %>% rbind(Association_titters, . ) -> Association_titters
+  }
+  write_tsv(Association_titters, paste0(Location_dir,"Results/CMV_titters_vs_female.tsv"))
+  Association_titters %>% arrange(`Pr(>|t|)`) %>% ggplot(aes(x=Estimate, y=-log10(`Pr(>|t|)`) )) + theme_bw() + geom_point() + xlab("Female effect on CMV antibody titter\n in CMV positive individuals") + xlim(-0.30, 0.3) + geom_vline(xintercept = 0,linetype="dotdash") + geom_hline(yintercept = -log10(0.05), linetype= "dotdash") -> Figure_titer
+  ggsave(paste0(Location_dir,"Results/Figures/SexTiterDifferences_CMVPositive.pdf"), Figure_titer)
+  
+  Association_titters %>% arrange(`Pr(>|t|)`) %>% write_tsv(. , path = paste0(Location_dir, "Results/CMV_vs_Titters.tsv"))
+  Figure_titer
+```
+
+Replication of sex differences in titters
+
+```{r Replication CMV-titters in females: 300BCG}
+#CMV measurements. 
+read_excel(  paste0(Location_dir,"Data/Replication/300BCG/2019 300BCG serologies_for_sergio.xlsx")) -> Info_serology_300bcg #Laurent Gillet’s lab measurements
+read_excel( paste0(Location_dir,"Data/Replication/300BCG/CMV IgG index 300BCG.xlsx"), sheet= "CMV_for_R") -> Info_serology_300bcg2 #JCI Olink paper (‘PMID: 32692728’)
+load( paste0(Location_dir,"Data/Replication/300BCG/data.Robj"), verbose=T) #Metadata from the cohort. Downloaded from 'PMID: 32692728’ GitLab's
+obj[[2]] %>% as_tibble() -> metadata_300bcg
+
+
+metadata_300bcg %>% rename(PatientID = `Patient,ID`) %>% left_join(Info_serology_300bcg) -> Replication_300bcg
+left_join(Replication_300bcg, Info_serology_300bcg2 ) -> Replication_300bcg2
+
+#Check age and sex
+Replication_300bcg %>% ggplot(aes(x=Age, fill=CMV )) + geom_histogram() + theme_bw()
+Replication_300bcg$Gender %>% table()
+
+
+
+#Check that IDs are good by checking age and sex assocasiations
+Replication_300bcg %>% filter(CMV %in% c("+", "-") ) %>%  glm( as.factor(CMV) ~ Gender + Age, . , family=binomial()) %>% summary() # relative assocaiton, not too strong
+
+
+#Check for titter assocaitons with females
+Replication_300bcg %>% filter(CMV == "+" ) %>% lm(`CMV ELISA` ~ Gender, . ) %>% summary() #Negative but not significant
+#This assocation is not significant at all. However, data from 32692728 is more promising
+Replication_300bcg2 %>% filter(CMV_status == "Positive" ) %>%  mutate(CMV_IgG_IU_ml = as.numeric(CMV_IgG_IU_ml))  %>% lm( CMV_IgG_IU_ml ~ Gender + Age , . )  %>% summary()  #IgG titters
+Replication_300bcg2 %>% filter(CMV_status == "Positive" ) %>%  mutate(CMV_IgG_Index = as.numeric(CMV_IgG_Index))  %>% lm( CMV_IgG_Index ~ Gender + Age , . )  %>% summary() #IgG index
+
+
+#PLOTS 
+Replication_300bcg2 %>% filter(CMV_status == "Positive" ) %>% ggplot(aes(x=Gender, y = as.numeric(CMV_IgG_IU_ml))) + geom_boxplot() + theme_bw() + geom_sina() + coord_flip() #Seems like there is a an upper limit in Units per ml
+Replication_300bcg2 %>% filter(CMV_status == "Positive" ) %>% ggplot(aes(x=Gender, y = as.numeric(`CMV ELISA`))) + geom_boxplot() + theme_bw() + geom_sina() + coord_flip()
+Replication_300bcg2 %>% filter(CMV_status == "Positive" ) %>% ggplot(aes(x=Gender, y = as.numeric(`CMV_IgG_Index`))) + geom_boxplot() + theme_bw() + geom_sina() + coord_flip()
+
+
+
+
+```
+
+
+Replciation in 500FG?
+

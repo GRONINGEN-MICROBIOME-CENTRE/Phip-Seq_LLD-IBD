@@ -1,0 +1,480 @@
+---
+title: "CMV_2_TL"
+author: "Sergio Andreu-Sanchez"
+date: "5/23/2023"
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## CMV Omics - Script 2: CMV effects in telomere length, aging markers and blood cell proportions.
+
+*R Markdown* of second script. Read data of LLD CMV seropositivity predictions (from script 1), telomere length measurements in 6 blood types (Flow-FISH), (blood) methylation age, T-cell maturation (sj-TRECS),  and cell counts measured in blood and predicted from blood bulk RNA-seq.
+
+
+```{r libraries, message=FALSE, warning=FALSE, results='hide'}
+Location_dir = "~/Documents/GitHub/CMV_Associations/"
+
+library(tidyverse)
+library(patchwork) #Combine plots
+library(lme4) # for mixed-model analysis of CMV-sex interaction
+library(regmed) #For multiple mediation
+library(MetBrewer) #coloring
+library(mediation) #individual mediation
+library(readxl)
+library(pheatmap)
+
+library(foreach) #paralellize FDR computation
+library(doParallel)
+
+source(paste0(Location_dir, "scripts/Functions.R"))
+source(paste0(Location_dir, "scripts/Functions_multivariate.R"))
+
+```
+
+
+
+```{r File load, message=FALSE, warning=FALSE, results='hide'}
+#####################
+#LLD CMV prediction##
+#####################
+Covariates = read_tsv(paste0(Location_dir,"Results/LLD_CMV_profile.tsv")) %>% filter(TimePoint == "Baseline") #1,488 samples
+
+#######################
+#predicted cell types #
+#######################
+all_cell_types = read_tsv(paste0(Location_dir,"Data/BIOS_cell_types_DeconCell_2019-03-08.LLD_subset.txt")) #Cell counts from Blood bulkRNA deconvolution
+#Formatting data since we want samples as columns intead of as rows
+all_cell_types %>% gather(key = var_name, value = value, 2:ncol(all_cell_types)) %>% spread_(key = names(all_cell_types)[1],value = 'value') %>% rename(ID = var_name) -> all_cell_types #1,180 samples with cell predictions
+
+#######################
+# measured cell types##
+#######################
+Phenotypes <- read_delim(paste0(Location_dir,"Data/Merged_Phenotypes_LLD.csv"), delim="|") 
+Phenotypes %>%  dplyr::select("ID", "Lymph", "Eryth", "Mono", "Neutro", "Thrombo", "Eosino","Blood_baso") %>% drop_na() -> cell_counts #1,570 LLD samples with blood cell counts
+
+#######################
+# Aging markers #######
+#######################
+
+Age_markers <- read_tsv(paste0(Location_dir,"Data/Combined_data_uncorrected.tsv"))
+Telomere_markers <- colnames(Age_markers)[grepl("MTL",colnames(Age_markers))]
+Telomere_markers = Age_markers %>% dplyr::select(c("Sample",Telomere_markers)) %>% mutate(MTL_gran = as.numeric(MTL_gran), `MTL_CD20+`=as.numeric(`MTL_CD20+`), `MTL_CD45+_CD20-`=as.numeric(`MTL_CD45+_CD20-`),`MTL_CD57+`=as.numeric(`MTL_CD57+`)) %>%
+  `colnames<-`(c("ID", "TL_Lymphocytes", "TL_Granulocytes", "TL_Naive_T-cells", "TL_Memory_T-cells","TL_B-cells","TL_NK-cells"))
+#Remove samples with all telomere lengths missing
+Telomere_markers[rowSums(is.na(Telomere_markers)) != (ncol(Telomere_markers)-1), ] -> Telomere_markers
+#Some samples are missing telomeres, we will impute it later. 1,299 samples with telomere lengths
+
+MethylAge = dplyr::select(Age_markers, c(Sample, Methyl.Age.Hannum.,Methyl.Age.Weidner.,Methyl.Age.Horvath.)) %>% rename(ID = Sample) %>% drop_na() #647 LLD samples with methylation age
+
+#Get all markers together
+read_tsv( paste0(Location_dir,"Data/Aging_and_health_markers.tsv")) -> Aging_health_markers
+          
+          
+```
+
+
+
+First, we will start imputing missing values in the telomere length. Imputation function is included in scripts/Functions.R. 
+Imputation function uses a seed. Then splits the data in 80% training and 20% test. For each cell type, it fits a linear model in the training data, using all other telomere lengths as predictors. R2 is calculated on the predicted data from the test (using caret). Then this is done in the data where there is actually missing values, and the accuracy obtained from the data with complete cases is used as an unbiased estimate.
+
+
+```{r Telomere length imputation,message=FALSE, warning=FALSE }
+List_telomere_imputation = Impute_telomere_data(Telomere_markers)
+Imputed_Telomere_markers = List_telomere_imputation[[1]] ; Imputed_accuracy = List_telomere_imputation[[2]]
+Telomere_markers %>% gather(Cell, TL, 2:7) %>% mutate(Type="Real") -> Real_lengths
+Imputed_Telomere_markers %>% gather(Cell, TL, 2:7) %>% mutate(Type="Imputed") -> Imputed_lengths
+rbind(Real_lengths, Imputed_lengths) %>% ggplot( aes(x=TL)  ) + theme_bw() + geom_histogram() + facet_grid(Cell~Type) 
+
+```
+
+
+Predicted cell counts are proportions based on bulk RNA-seq data. RNA-seq counts are compositional. And thus, the cell proportions also are interdependent between them. To alleviate this interdependency we will use log ratios. 
+I have tested to different log ratios:
+  - We will use Monocytes proportion (`Monocytes (CD14+)) as our reference, and perform ALR on that.
+  - We will use per-sample geometric means as references, and perform CLR.
+cell_matrix_xlr will be the ratio used for subsequent analyses
+```{r CLR transformation in predicted cell counts, message=FALSE, warning=FALSE, results='hide' }
+
+Clean_and_ALR(all_cell_types) -> cell_matrix_alr
+Clean_and_CLR(all_cell_types) -> cell_matrix_clr
+cell_matrix_xlr = cell_matrix_alr #Matrix to use
+
+```
+
+
+Correlation of CMV seropositivity with 1. Aging markers, 2. Predicted cell counts,  3. Cell counts. We will use a linear model while controlling for chronological age and sex.
+
+```{r Assocation CMV, message=FALSE, warning=FALSE }
+Basic_association = function( DF = Imputed_Telomere_markers , Covariates = Covariates ){
+  Results = tibble()
+  left_join(Covariates, DF, by="ID") -> DF_association
+  for ( Phenotype in colnames(select(DF, -ID)) ){
+    DF_association[Phenotype] = scale(DF_association[Phenotype])
+    Formula = as.formula( paste0("`", Phenotype, "` ~ Age + Sex + CMV_prediction" )  )
+    lm(Formula, DF_association) %>% summary() -> Result_pheno
+    N  =length(Result_pheno$residuals)
+    Result_pheno$coefficients %>% as.data.frame() %>% rownames_to_column("Regressor") %>% filter(Regressor == "CMV_prediction") %>% mutate(Phenotype = Phenotype, .before=1) %>% select(-Regressor) %>% as_tibble() %>% mutate(N_samples = N) -> Result_pheno
+    rbind(Results, Result_pheno) -> Results
+  }
+  return(Results)
+}
+
+Association_telomeres = Basic_association(Imputed_Telomere_markers, Covariates) %>% mutate(Pheno_class = "TL")
+Association_Methylation = Basic_association(MethylAge, Covariates)%>% mutate(Pheno_class = "Methyl_Age")
+Association_CellPred =  Basic_association(cell_matrix_xlr, Covariates)%>% mutate(Pheno_class = "PredictedCell") 
+Association_Cell =  Basic_association(cell_counts, Covariates)%>% mutate(Pheno_class = "CellCounts")
+
+Association_telomeres %>% ggplot(aes(x= Phenotype ,y = Estimate, fill = -log10(`Pr(>|t|)`)  )) + geom_bar(stat="identity") + theme_bw() + coord_flip() + scale_fill_gradientn( colours =  met.brewer(name="VanGogh3", type="continuous")) -> Telomere_association_plot
+
+
+rbind(rbind(Association_telomeres, Association_CellPred), Association_Cell) -> Association_results
+
+#Plot
+Association_results %>% mutate(P.threshold = ifelse(`Pr(>|t|)` < 0.000001, "P<1e-6", ifelse(`Pr(>|t|)` < 0.0001, "1e-6<P<1e-4", ifelse(`Pr(>|t|)` < 0.001, "1e-4<P<1e-3", ifelse(`Pr(>|t|)` < 0.01, "1e-3<P<1e-2", "P>1e-2" )))) ) %>% mutate(P.threshold = factor(P.threshold, levels = c("P>1e-2","1e-3<P<1e-2","1e-4<P<1e-3","1e-6<P<1e-4", "P<1e-6" ) ) )  %>% ggplot(aes(x= Phenotype ,y = Estimate, color = P.threshold )) + geom_point() + theme_bw() + coord_flip() + facet_wrap(~Pheno_class, scales="free_y") + theme(axis.title.y=element_blank(), axis.text.y=element_text(size=8) ) + scale_color_discrete(type = met.brewer(name="Klimt", n=5,type="discrete"))  + geom_errorbar(aes(ymin=Estimate-2*`Std. Error`, ymax=Estimate+2*`Std. Error`), width=.2) + geom_hline(yintercept = 0, linetype='dotted', col = 'grey' ) -> All_associations_plot
+#Save
+print(Association_results %>% arrange(`Pr(>|t|)`) )
+write_tsv(rbind(Association_results, Association_Methylation ) , paste0(Location_dir,"Results/Associations_CMV_Cell_Age.tsv"))
+
+
+ggsave(paste0(Location_dir,"Results/Figures/CMV_associations.pdf"), All_associations_plot, height = 4, width = 10 )
+
+```
+
+
+
+We observe an association of CMV with cell counts and telomere lengths. We wonder if this associations are age or sex dependent. For that, fitted interaction models and observe if adding an interative term is better than an additive model.
+
+
+```{r Age-sex interactions with CMV, message=FALSE, warning=FALSE }
+Interaction_association = function( DF = Imputed_Telomere_markers , Covariates = Covariates ){
+  Results = tibble()
+  left_join(Covariates, DF, by="ID") -> DF_association
+  for ( Phenotype in colnames(select(DF, -ID)) ){
+    DF_association[Phenotype] = scale(DF_association[Phenotype])
+    Formula0 = as.formula( paste0("`", Phenotype, "` ~ Sex + Age + CMV_prediction" )  )
+    Formula1 = as.formula( paste0("`", Phenotype, "` ~ Sex + Age * CMV_prediction" )  )
+    Formula2 = as.formula( paste0("`", Phenotype, "` ~ Age + Sex  * CMV_prediction" )  )
+    #Formula3 = as.formula( paste0("`", Phenotype, "` ~ Sex * Age * CMV_prediction" )  )
+    lm(Formula0, DF_association) -> R0
+    lm(Formula1, DF_association) -> R1
+    lm(Formula2, DF_association) -> R2
+    #lm(Formula3, DF_association) -> R3
+    
+    anova(R0, R1) -> A ; A$`Pr(>F)` -> P1
+    anova(R0, R2) -> A ; A$`Pr(>F)` -> P2
+
+    for (i in c(1,2)){
+      Model = list(R1, R2)[[i]]
+      Model %>% summary() -> Result_pheno
+      N  =length(Result_pheno$residuals)
+      Result_pheno$coefficients %>% as.data.frame() %>% rownames_to_column("Regressor")  %>% mutate(Phenotype = Phenotype, .before=1)  %>% as_tibble() %>% mutate(N_samples = N) %>% mutate(Model= c("Age-CMV", "Sex-CMV")[i], P_model = c(P1[2], P2[2])[i] ) -> Result_pheno
+    rbind(Results, Result_pheno) -> Results
+    }
+  }
+  return(Results)
+}
+
+#Telomere interaction
+Association_telomeres_interaction = Interaction_association(Imputed_Telomere_markers, Covariates) %>% mutate(Pheno_class = "TL")
+Association_telomeres_interaction %>% filter(grepl(":", Regressor)) %>% arrange(`Pr(>|t|)`) %>% print()
+
+#Predicted Cell interaction 
+Association_CellPred_interaction =  Interaction_association(cell_matrix_xlr, Covariates)%>% mutate(Pheno_class = "PredictedCell") 
+Association_CellPred_interaction %>% filter(grepl(":", Regressor)) %>% arrange(`Pr(>|t|)`) %>% print()
+
+```
+
+
+```{r Permutation Interactions, message=FALSE, warning=FALSE}
+
+Get_Permutation_FDR = function(Assocation,DF, Cov, Permutations=100, Term ="Sex" ){
+  set.seed(87)
+  N_perm = Permutations
+  
+  num_cores <- 4  # Number of cores/workers to be used
+  cl <- makeCluster(num_cores)
+  registerDoParallel(cl)
+  
+  Permuted_ps <- foreach(Permutation = 1:N_perm, .combine = c, .packages = c("dplyr","tibble" ),.export = c("Interaction_association") ) %dopar% {
+  print(paste0("Permutation:", Permutation))
+  Permuted_cmv <- sample(Cov$CMV_prediction, replace = FALSE, size = dim(Cov)[1])
+  if (Term == "Sex") {
+    Permuted_Sex <- sample(Cov$Sex, replace = FALSE, size = dim(Cov)[1])
+    Permuted_cov <- mutate(Cov, CMV_prediction = Permuted_cmv, Sex = Permuted_Sex)
+    Permuted <- Interaction_association(DF, Covariates = Permuted_cov)
+    P_p <- Permuted %>% filter(Regressor == "Sex:CMV_prediction")
+    }
+  P_p$`Pr(>|t|)`
+  }
+  
+  stopCluster(cl)
+
+  FDR = Compute_FDR_null(Assocation, Permuted_ps)
+  FDR2 = Compute_FDR2(Assocation, Permuted_ps, Permutations)
+  return(list(FDR, FDR2))
+}
+Compute_FDR_null =  function(P, Permutation_results,fdr_threshold = 0.05 ){
+  # calculate FDR for each observed P-value
+  fdr_values <- sapply(P, function(p) {
+    # count number of false positives (i.e., permuted P < observed P)
+    false_positives <- sum(Permutation_results <= p)
+    # calculate FDR
+    fdr <- false_positives / sum(Permutation_results <= fdr_threshold)
+    # ensure FDR is between 0 and 1
+    fdr <- ifelse(fdr < 0, 0, ifelse(fdr > 1, 1, fdr))
+    return(fdr)
+  })
+  return(fdr_values)
+}  
+Compute_FDR2 =  function(P, Permutation_results,Permutations = 100 ){
+  Order = order(P)
+  tibble(Position = Order, FDR = NA) -> values
+  fdr_values = c()
+  for ( i in seq(P) ){
+    Threshold = P[which(Order == i)]
+    FDR_v = sum(Permutation_results <= Threshold) / Permutations / i
+    values %>% mutate(FDR = ifelse(Position == i, FDR_v, FDR  )) -> values
+  }
+  return(values$FDR)
+}  
+
+
+#Sex interaction
+rbind( Association_telomeres_interaction,Association_CellPred_interaction)   %>% filter(Regressor == "Sex:CMV_prediction" ) %>% select(`Pr(>|t|)`) %>% as_vector() -> Sex_Ps
+#Association_telomeres_interaction  %>% filter(Regressor == "Sex:CMV_prediction" ) %>% select(`Pr(>|t|)`) %>% as_vector() -> Sex_Ps
+
+
+Get_Permutation_FDR(Assocation = Sex_Ps, DF = full_join(Imputed_Telomere_markers,cell_matrix_xlr), Cov = Covariates, Term = "Sex", Permutations = 1000 ) -> FDR_perm 
+
+
+rbind( Association_telomeres_interaction,Association_CellPred_interaction)   %>% filter(Regressor == "Sex:CMV_prediction" ) %>% mutate(FDR_perm1 = FDR_perm[[1]], FDR_perm2 = FDR_perm[[2]], FDR_bh = p.adjust(`Pr(>|t|)`, "fdr")  ) %>% arrange(FDR_perm2) -> Association_interaction
+
+write_tsv(Association_interaction %>% select(-c(FDR_perm1, FDR_bh)) %>% rename(FDR_p = FDR_perm2) , paste0(Location_dir,"Results/CMV_sex_interaction_TLandCells.tsv"))
+
+```
+
+
+We observe some signal in telomere length interaction, and in cell predictions. In order to gain power in telomere length interactions, we will run the model using random effects, so that we can pull all cell types together, and assuming the effect is the same to all cell types. Model: TL ~ CMV + Age + Sex + Cell + Interaction_term + Cell:CMV + (1|ID)
+
+```{r Age-sex interactions with CMV mixed telomere model, message=FALSE, warning=FALSE }
+
+set.seed(895)
+
+left_join( select(Covariates, c("ID", "Sex", "Age", "CMV_prediction")) , Imputed_Telomere_markers, by="ID")  %>%
+ gather(Cell, TL ,5:10) -> Long_DF_model
+#Center Age
+Long_DF_model$Age = Long_DF_model$Age - mean(Long_DF_model$Age[!is.na(Long_DF_model$Age)] )
+
+Long_DF_model %>% lmerTest::lmer(TL ~ CMV_prediction + Age + Sex + Cell + CMV_prediction +  CMV_prediction:Cell + (1|ID), data= ., REML = F ) -> Mixed_model_telomeres_0
+Long_DF_model %>% lmerTest::lmer(TL ~ CMV_prediction + Age + Sex + Cell + CMV_prediction:Sex +CMV_prediction:Cell  + (1|ID), data= ., REML = F ) -> Mixed_model_telomeres_sex
+Long_DF_model %>% lmer(TL ~ CMV_prediction + Age + Sex + Cell + CMV_prediction:Age + CMV_prediction:Cell + (1|ID), data= . ,REML = F) -> Mixed_model_telomeres_age
+
+
+
+print(Mixed_model_telomeres_sex %>% summary())
+
+```
+We observe a significant interaction effect of sex with CMV. The reduction of telomere length if female is higher than if males. We will show this in a plot:
+```{r Sex-specific CMV effect, message=FALSE, warning=FALSE }
+
+Long_DF_model %>% mutate(`Sex:CMV` = ifelse(CMV_prediction==1 & Sex==2, "CMV_Female", ifelse(CMV_prediction==1 & Sex==1, "CMV_Male", ifelse(CMV_prediction==0 & Sex==1, "Male", "Female") )   )  )  %>% drop_na() %>% ggplot(aes(x=Age, y= TL, col=`Sex:CMV`  )) + geom_point(alpha=0.2, size=1) + geom_smooth(method='lm', formula= y~x, se=F) + theme_bw() + facet_wrap(~Cell) + scale_color_discrete(type = met.brewer(name="Klimt", n=5,type="discrete") )
+
+
+left_join( select(Covariates, c("ID", "Sex", "Age", "CMV_prediction")) , cell_matrix_clr, by="ID")  %>%
+ gather(Cell, value ,5:37) -> Long_DF_model_cell
+
+
+Association_interaction %>% filter(grepl(":", Regressor)) %>% arrange(`Pr(>|t|)`) %>% filter(FDR_perm2 < 0.2) -> Plot_cell
+Long_DF_model_cell %>% filter(Cell %in%  Plot_cell$Phenotype)  %>% mutate(CMV_prediction = as.factor(CMV_prediction)) %>% drop_na() %>% ggplot(aes(x=Age, y= value, col=CMV_prediction )) + geom_point(alpha=0.2, size=1) + geom_smooth(method='lm', formula= y~x, se=F) + theme_bw() + facet_wrap(~Cell, scales = "free") + scale_color_discrete(type = met.brewer(name="Klimt", n=2,type="discrete") ) + ylab("Cell proportion (CLR)")  
+
+
+```
+
+And we checked how CMV infection confound TL-sex associations
+```{r Does the sex effect dissappear with CMV infection, message=FALSE, warning=FALSE }
+
+left_join(Imputed_Telomere_markers, Covariates) -> For_testing
+For_testing %>% filter(CMV_prediction == 0) %>% lm(`TL_NK-cells` ~ Age + Sex + PC1+PC2+PC3+PC4+PC5, . ) %>% summary()
+For_testing %>% filter(CMV_prediction == 1) %>% lm(`TL_NK-cells` ~ Age + Sex + PC1+PC2+PC3+PC4+PC5, . ) %>% summary()
+
+#The effect of sex disappears in individuals that are CMV positive
+table(For_testing$Sex, For_testing$CMV_prediction) %>% chisq.test() #CMV - and CMV + are balanced in sex
+
+
+For_testing %>% filter(!is.na(CMV_prediction)) %>% mutate(Sex = ifelse(Sex==1, "Male", "Female"), CMV_prediction= ifelse(CMV_prediction==0, "seronegative", "seropositive") ) %>% ggplot(aes(x=Sex, y=`TL_NK-cells`, col=CMV_prediction )) + geom_boxplot(outlier.shape = NA) + theme_bw() + ggforce::geom_sina(alpha=0.5) + scale_color_manual(values = met.brewer(name="Cassatt1",n =5, type="discrete")[c(1,5)] ) -> Sex_interaction_effect
+
+ggsave("~/Documents/GitHub/CMV_Associations/Results/Figures/CMV_sex_interaction.pdf", Sex_interaction_effect, height = 3, width = 6 )
+
+print(Sex_interaction_effect)
+```
+
+Finally, we will perform mediation analysis to conclude to what extend CMV effect on telomeres is mediated by cell proportios
+
+```{r mediation,  message=FALSE, warning=FALSE}
+lambda.grid <- seq(from = 0.4, to = 0.01, by = -0.01)
+
+
+left_join(left_join(Imputed_Telomere_markers, cell_matrix_xlr, by="ID"), select(Covariates, c(ID, CMV_prediction)), by="ID" ) %>% drop_na() -> Matched_data
+for (Column in colnames(Matched_data)){
+  if (Column %in% c("ID", "CMV_prediction") ){ next } 
+    Matched_data[Column] = scale(Matched_data[Column])
+}
+
+x <-  select(Matched_data, CMV_prediction)
+y <- select(Matched_data, colnames( select(Telomere_markers, -ID) )  )
+med <- select(Matched_data, colnames( select(cell_matrix_xlr, -ID) )  )
+
+fit.grid <-  mvregmed.grid(x, med, y, lambda.grid)
+#summary(fit.grid)
+plot.mvregmed.grid(fit.grid)
+#Take best model
+mvfit.best <- mvregmed.grid.bestfit(fit.grid)
+
+summary(mvfit.best)
+
+
+#Default eps= 0.01 ;set to 0.04, which will show three CMV-telomere relpationships
+mvfit.edges <- mvregmed.edges(mvfit.best, eps = 0.01) #Change EPS to show more/less edges
+pdf("~/Documents/GitHub/CMV_Associations/Results/Figures/Network_CMV.pdf",)
+plot.mvregmed.edges(mvfit.edges, x.color = "palegreen", y.color = "palevioletred", med.color = "skyblue", v.size = 10, seed = 3)
+dev.off()
+
+left_join(Imputed_Telomere_markers, Covariates) %>% 
+lm(`TL_NK-cells` ~ CMV_prediction, .) %>% summary()
+
+
+#Show some individual mediation
+left_join(Telomere_markers, cell_matrix_xlr) %>% left_join(Covariates) %>% dplyr::select( `CD8+ EM CD45RA- CD27-`, CMV_prediction,  `TL_NK-cells`, Age, Sex, `CD8+ T cells`, `NK cells (CD3- CD56+)`  ) %>% drop_na() -> Mediation_input
+fit.mediator=lm(`CD8+ EM CD45RA- CD27-`~ CMV_prediction + Age + Sex + `CD8+ T cells` ,  Mediation_input )
+fit.dv=lm( `TL_NK-cells` ~ CMV_prediction +`CD8+ EM CD45RA- CD27-` +`CD8+ T cells` + Age + Sex, Mediation_input )
+
+results = mediate(fit.mediator, fit.dv, treat='CMV_prediction', mediator='CD8+ EM CD45RA- CD27-', boot=T)
+summary(results) #31%
+
+fit.mediator2=lm(`CD8+ T cells`~ CMV_prediction + Age + Sex + `CD8+ EM CD45RA- CD27-` ,  Mediation_input )
+fit.dv2=lm( `TL_NK-cells` ~ CMV_prediction +`CD8+ T cells` + Age + Sex + `CD8+ EM CD45RA- CD27-`, Mediation_input )
+results2 = mediate(fit.mediator2, fit.dv2, treat='CMV_prediction', mediator='CD8+ T cells', boot=T)
+summary(results2) #no significant
+
+fit.mediator3=lm(`NK cells (CD3- CD56+)` ~ CMV_prediction + Age + Sex ,  Mediation_input )
+fit.dv3=lm( `TL_NK-cells` ~ CMV_prediction +`NK cells (CD3- CD56+)`  + Age + Sex, Mediation_input )
+results3 = mediate(fit.mediator3, fit.dv3, treat='CMV_prediction', mediator='NK cells (CD3- CD56+)', boot=T)
+summary(results3) #No significant mediation
+
+
+```
+
+
+We explore if CMV infection affects correlations between biomarkers
+
+```{r CMV effects }
+Compute_heterogeneity = function(C1, C2, Sample_size1=dim(S1)[1], Sample_size2=dim(S2)[1] ){
+
+  #compute heterogeneity Pvalue using Fisher's z-test 
+  #Fisher's z-test is used to compare the difference between two correlation coefficients. It assumes that the correlation coefficients are normally distributed after being transformed using Fisher's z-transformation.
+  C1 %>% as.data.frame() %>%  rownames_to_column("Marker1") %>% as_tibble() %>% gather(Marker2, Correlation ,2:(dim(C1)[2]+1) ) %>% filter(! Correlation == 1) ->  C1_long
+  C2 %>% as.data.frame() %>%  rownames_to_column("Marker1") %>% as_tibble() %>% gather(Marker2, Correlation ,2:(dim(C1)[2]+1) ) %>% filter(! Correlation == 1) -> C2_long
+  left_join(C1_long, C2_long, by = c("Marker1", "Marker2"), suffix=c("_CMV", "_noCMV")) -> DF
+  
+  Done = c()
+  Results_meta =tibble()
+  for (line in seq(nrow(DF))){
+    L = DF[line,]
+    Name= paste0(sort(c(L$Marker1, L$Marker2)), collapse="|")
+    #if (Name == "MetaboAge|MetaboHealth" ){ break }
+    if (Name %in% Done ){ next 
+    } else { Done = c(Done, Name) } 
+    
+    z1 = atanh(L$Correlation_CMV)
+    z2 = atanh(L$Correlation_noCMV)
+    se_diff <- sqrt(1/(Sample_size1 - 3) + 1/(Sample_size2 - 3))
+  
+    z_stat <- (z1 - z2) / se_diff
+    p_value <- 2 * (1 - pnorm(abs(z_stat)))
+    
+    tibble(N =Name, Z_stat= z_stat, P=p_value, Rho_CMV1=L$Correlation_CMV, Rho_CMV0=L$Correlation_noCMV, N_CMV1=Sample_size1, N_CMV0=Sample_size2 ) %>% rbind(Results_meta, .) -> Results_meta
+  }
+  Results_meta %>% arrange(desc(abs(Z_stat))) %>% return()
+
+}
+Plot_heatmaps = function(C1, C2, Output_name1="Results/Figures/Aging_heatmap_CMVpositive.png", Output_name2="Results/Figures/Aging_heatmap_CMVnegative.png" ){
+  C1 %>% pheatmap() -> heatmap1
+  C1[heatmap1$tree_row$order, heatmap1$tree_col$order]  %>% pheatmap(cluster_rows=F, cluster_cols=F, display_numbers = T, main = "CMV_positive") -> heatmap1.2
+  C2[heatmap1$tree_row$order, heatmap1$tree_col$order] %>% pheatmap(cluster_rows=F, cluster_cols=F, display_numbers = T, main = "CMV_negative") -> heatmap2
+  #save
+  ggsave( paste0(Location_dir, Output_name1), plot = heatmap1.2, dpi = 300)
+  ggsave( paste0(Location_dir, Output_name2), plot = heatmap2, dpi = 300)
+}
+
+
+Aging_health_markers %>% dplyr::select(-ID) %>% drop_na() %>% cor() %>% pheatmap()
+
+
+#For CMV positive
+Aging_health_markers %>% filter(ID %in%  filter(Covariates, CMV_prediction == 1)$ID ) %>% drop_na() ->S1
+S1 %>% dplyr::select(-ID) %>% drop_na() %>% cor()  -> C1
+
+
+#For CMV negative
+Aging_health_markers %>% filter(ID %in%  filter(Covariates, CMV_prediction == 0)$ID ) %>% drop_na() -> S2
+S2 %>% dplyr::select(-ID)  %>% cor() -> C2
+
+Plot_heatmaps(C1,C2)
+Compute_heterogeneity(C1, C2) -> Diff_noresid
+
+
+#Use Age-residualized data
+Remove_variability(Aging_health_markers, Covariates, Covariates_n = c("Age") ) -> Aging_health_markers2
+
+
+Aging_health_markers2 %>% filter(ID %in%  filter(Covariates, CMV_prediction == 1)$ID ) %>% drop_na() ->S3
+S3 %>% dplyr::select(-ID)  %>% cor()  -> C3
+Aging_health_markers2 %>% filter(ID %in%  filter(Covariates, CMV_prediction == 0)$ID ) %>% drop_na() ->S4
+S4 %>% dplyr::select(-ID)  %>% cor()  -> C4
+
+Plot_heatmaps(C3,C4, "Results/Figures/ResidAging_heatmap_CMVpositive.png", "Results/Figures/ResidAging_heatmap_CMVnegative.png")
+Compute_heterogeneity(C3, C4, dim(S3)[1], dim(S4)[1] ) -> Diff_resid
+
+
+left_join(Diff_noresid, Diff_resid, by="N", suffix=c("","_resid")) %>% mutate(Confounded_by_age = abs(Z_stat_resid-Z_stat) ) -> Heterogeneity
+
+write_tsv(Heterogeneity, paste0(Location_dir, "Results/Heterogeneity_confounding_CMV_Aging.tsv" ))
+
+```
+
+
+Next, we will replicate the TL assocations. 300BCG is a cohort with both young and old participants. TLs were measured in the participants, and there is serology for EBV and CMV.
+The TLs were measured by qPCR. They reflect the average telomere length per chromosome end. It is corrected for genome numbers with a single-copy reference gene. You can find more details in the kit's manual: https://sciencellonline.com/PS/8918.pdf. Meaning that it is an average between many cell types, and the effects might be weaker.
+
+```{r CMV effect in TL 300BCG }
+read_excel(paste0(Location_dir,"Data/300BCG_Telomere_Sergio.xlsx"), sheet = "Old") %>% rename(PatientID=`Subject ID`, TL=`Visit 1 Length`, CMV1 = `CMV stat...7`, CMV2=`CMV stat...9`   ) -> TL_old 
+read_excel(paste0(Location_dir,"Data/300BCG_Telomere_Sergio.xlsx"), sheet = "Young") %>% rename(PatientID=`Subject ID`, TL=`Visit 1 Length`, CMV1 = `CMV stat...7`, CMV2=`CMV stat...9`   ) -> TL_young
+
+rbind(TL_old %>% mutate(Age_group = "old"), TL_young %>% mutate(Age_group = "young") ) -> TL_replication
+TL_replication %>% mutate(CMV1 = ifelse(CMV1=="-", 0, 1 ), CMV2 =ifelse(CMV2=="Negative", 0, 1 )  ) -> TL_replication
+TL_replication %>% filter(!CMV1 == CMV2)
+TL_replication %>% group_by(CMV1) %>% summarise(n())
+TL_replication %>% ggplot(aes(TL)) + geom_histogram() + theme_bw()
+TL_replication %>% ggplot(aes(x = Age_group , y = TL )) + geom_boxplot() + theme_bw()
+TL_replication %>% ggplot(aes(x = as.numeric(Age) )) + geom_histogram() + theme_bw()
+
+
+lm(TL  ~ Age_group + Sex + CMV1, TL_replication) %>% summary() #We see a negative trend with CMV infection, however is not significant
+lm(TL  ~ Age_group + Sex*CMV1, TL_replication) %>% summary() #We also see a negative interaction in females, however, not significant
+
+TL_replication %>% ggplot( aes(x=as.factor(CMV1), y= TL ) ) + geom_boxplot(outlier.shape = NA) + ggforce::geom_sina() + theme_bw()
+lm(TL  ~ CMV1, TL_replication ) %>% summary()
+
+
+
+```
+
+
+
+
+
+

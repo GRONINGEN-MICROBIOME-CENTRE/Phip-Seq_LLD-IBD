@@ -1,0 +1,227 @@
+---
+title: "PhIPSeq_CMV_predictionV2"
+author: "Sergio Andreu-Sanchez"
+date: "5/23/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# CMV Omics - Script 1: Prediction of CMV seropositivity based on PhIP-Seq profiles.
+
+*R Markdown* of first script. Read data of LLD and IBD cohorts. Use ELISA CMV IgG information from IBD samples to build and compare predictive models. Use the best predictive model on LLD data. Visualize predictions and save dataset for subsequent analyses.
+
+
+```{r libraries, message=FALSE, warning=FALSE, results='hide'}
+library(tidyverse)
+library(readxl)
+library(vegan)
+library(pheatmap)
+library(caret)
+library(glmnet)
+library(glmnetUtils) 
+library(MetBrewer)
+```
+
+## Read data necessary for running script
+
+Data needed
+- PhipSeq_covariates.tsv
+- Immuno_matrix_postSelection.rds : PhIP-Seq profile. Keep IBD and LLD samples
+- Serology_CMV_IBD_antibodies (1).xlsx : Serology data for IBD cohort
+- CMV_peptides.tsv : Selection of PhIP-Seq peptides that belong to CMV 
+
+```{r File load, message=FALSE, warning=FALSE, results='hide'}
+Location_dir = "~/Documents/GitHub/CMV_Associations/"
+
+
+#LLD PhipSeq covariates for both Baseline and Follow-up samples
+Covariates_PhipSeq <- read_tsv(paste0(Location_dir, "Data/PhipSeq_covariates.tsv")) #Need to get PhipSeq covariates here, so that I can match with Immuno matrix, predictions,etc
+
+#Phip-Seq enrichment profile matrix. Peptides selection from previous paper --> Includes three cohorts, filter IBD and LLD
+immuno_matrix_total <- readRDS(paste0(Location_dir, 'Data/Immuno_matrix_postSelection.rds')) %>% filter(grepl("32_|33_", ID ) )
+immuno_matrix_total$ID <- immuno_matrix_total$ID %>% str_replace(".*_", "")
+
+#Serological information
+Serology_CMV_IBD_antibodies_1 <- read_excel(paste0(Location_dir,"Data/Serology_CMV_IBD_antibodies (1).xlsx")) %>% drop_na() %>% rename(ID = Sample_id_WIS)
+Serology_CMV_IBD_antibodies_1$ID <- Serology_CMV_IBD_antibodies_1$ID %>%  str_replace(".*_", "")
+
+#Selection of Peptides that represent CMV proteins
+#cmv_peptides <- colnames(read_csv('Data/CMV for IDs from covariates.csv'))[3:82] 
+cmv_peptides <- read_tsv(paste0(Location_dir,"Results/CMV_peptides.tsv"))
+cmv_peptides <- cmv_peptides$Peptide
+#Change to read a list of only CMV peptides
+#cmv_peptides = cmv_peptides[! cmv_peptides == "agilent_7061"] #wrong one
+immuno_matrix_total %>% select(c("ID", cmv_peptides)) -> cmv_data #There are no NAs
+#Match Serology with cmv_data
+Serology_CMV_IBD_antibodies_1 %>% select(ID, `CMV-IgG-positivity`) %>% left_join(., cmv_data, by="ID") -> Serology_CMV_IBD_antibodies_2
+
+```
+
+
+
+## Prepare and check dataset for prediction
+
+Notes: By checking the heatmap I noticed there was a peptide in the original code that was not from CMV (twist_7061). This shall be removed from the CMV list.
+To be done: Peptide selection in a previous script --> Check peptides, heatmap, alignment, epitope stats
+
+```{r Prepare data prediction, message=FALSE, warning=FALSE }
+Serology_CMV_IBD_antibodies_2 %>% group_by(`CMV-IgG-positivity`) %>% summarise(n()) 
+Serology_CMV_IBD_antibodies_2 %>% select(-c(ID,  `CMV-IgG-positivity`)) %>% apply(1, sum) -> Positive_peptides
+Serology_CMV_IBD_antibodies_2 %>% mutate(Positive_peptides = Positive_peptides, .before=3 ) -> Serology_CMV_IBD_antibodies_2
+#Distribution positive peptides
+Serology_CMV_IBD_antibodies_2 %>% ggplot(aes(x = Positive_peptides)) + geom_histogram() + theme_bw()
+#Relation between peptides
+Serology_CMV_IBD_antibodies_2 %>% select(-c(ID,  `CMV-IgG-positivity`,Positive_peptides)) %>% t() %>% vegdist(., method = "manhattan") %>% as.matrix() %>% 
+  `colnames<-`( colnames(Serology_CMV_IBD_antibodies_2)[4:dim(Serology_CMV_IBD_antibodies_2)[2]] ) %>%  pheatmap(color = met.brewer(name="Cassatt2", type="continuous") ) %>% print()
+#Twist_7061 is weird. Two big clusters similar among them, different to the other. Check what proteins do each group belong two
+```
+
+
+## Prediction model comparison
+
+We will repeat a K-fold cross-validation procedure N times. Each CV, a new data partition will be performed. Accuracy of prediction on held-out data will be used for unbiased accuracy estimation.
+
+Notes about previous script: 
+  Lasso predictions were not between 0-1 (they were logit), thus results were wrong
+  RDA + logistic regression was wrong. It was using the held-out data for both for training and testing
+```{r Cross-Validation, message=FALSE, warning=FALSE, results='hide'}
+#Setting sed so that partitions will be constant if this code is ran
+set.seed(20222)
+
+#Accuracies will be saved in this data frame
+Tibble_performances = tibble()
+
+N = 5 #Number of repeptition of the CV
+K = 5 #Number of folds to split the data in
+Lasso_n = 4 #Number of folds to split the training data  ( (K-1)/K from total data ) for cross-validation to pick up the best hyperparameter lambda (regularization strength) 
+
+Serology_CMV_IBD_antibodies_2 %>% mutate(`CMV-IgG-positivity` = as.factor(`CMV-IgG-positivity` ) ) -> Serology_CMV_IBD_antibodies_2
+#Repeat cross-validation 5 times
+for (Repeat in 1:N){
+  print( paste0("Running iteration: ", as.character(Repeat) ) )
+  #Split data in folds
+  row_folds <- createFolds (1:nrow(Serology_CMV_IBD_antibodies_2), k=K) 
+  for (i in names(row_folds)){
+    #print( paste0("Running: ", i ) )
+    select_rows <- row_folds[[i]]
+    test <- Serology_CMV_IBD_antibodies_2[select_rows,]
+    train <- Serology_CMV_IBD_antibodies_2[-select_rows,]
+    
+    ##Model 1: Logistic regression: IgG ~ Number of positive peptides
+    logistic_model <- glm(`CMV-IgG-positivity` ~ Positive_peptides, family=binomial(link='logit'), train)
+    #predict probabilities
+    logistic_probabilities<- predict(logistic_model, newdata=test, type = "response")
+    #set threshold
+    logistic_predictions = rep(0, dim(test)[1])
+    logistic_predictions[logistic_probabilities>.5] = 1
+    #determine accuracy
+    current_accuracy_logistic<-sum(as.character(logistic_predictions)==as.character(test$`CMV-IgG-positivity`))/length(logistic_predictions)
+
+    rbind(Tibble_performances, tibble( Model="Logistic_with_Sum", Accuracy= current_accuracy_logistic, CV=i, Repetition = Repeat )) -> Tibble_performances
+
+    ##Model 2: Logistic regression with Lasso normalization, using all CMV peptides ##family= binomial => logistic regression, alpha=1 => lasso
+    
+    train_lasso<- train %>% dplyr::select(-c("ID","Positive_peptides")) %>% as.data.frame()
+    test_lasso <- test %>% dplyr::select(-c("ID","Positive_peptides")) %>% as.data.frame()
+    # Find the best lambda using cross-validation.
+    #alpha is an hyperparameter that lets you choose between l1 and l2 penalty. An alpha of 1 corresponds to lasso regression
+    model_lasso=glmnetUtils::cv.glmnet( `CMV-IgG-positivity` ~., train_lasso, alpha = 1, nfolds = Lasso_n, family = "binomial", type.measure="class", parallel=TRUE)
+    # Fit the final model on the training data
+    lasso_probabilities = predict(model_lasso, newdata=data.frame(test_lasso %>% select(- `CMV-IgG-positivity`)), type="response", s="lambda.min" )
+    lasso_predictions = rep(0, dim(test)[1])
+    lasso_predictions[lasso_probabilities>.5] = 1
+    
+    current_accuracy_lasso<- sum(as.character(lasso_predictions)==as.character(test_lasso$`CMV-IgG-positivity`))/length(lasso_predictions)
+
+    rbind(Tibble_performances, tibble( Model="Logistic_Lasso", Accuracy= current_accuracy_lasso, CV=i, Repetition = Repeat )) -> Tibble_performances
+
+    ##Model 3: RDA using Serology as independent variable
+    #1st find new dimensionality
+    Ig = train$`CMV-IgG-positivity`
+    Matrix_peptides = select(train, -c(ID, `CMV-IgG-positivity`, Positive_peptides))
+    rda(Matrix_peptides ~ Ig) -> PC
+    summary(PC)$sites -> PCs
+    summary(PC)$species -> sp
+    #Predict IG using the new dimensions
+    glm(Ig ~ RDA1, as_tibble(PCs) %>% mutate(Ig= as.factor(Ig)) , family = binomial(link="logit"), control = list(maxit = 100, epsilon=1)) -> Model
+    #Project test data to new dimensionality ; this projection has correlation 1 with PCs  as.matrix(Matrix_peptides  )  %*% as.matrix(sp)  %>% as_tibble() 
+    Ig_test <- test$`CMV-IgG-positivity`
+    Matrix_test = select(test, -c(ID, `CMV-IgG-positivity`, Positive_peptides))
+    as.matrix(Matrix_test) %*% as.matrix(sp) %>% as_tibble() -> Projected_test
+    
+   
+    
+    pca_probabilities <-  predict(Model, newdata = dplyr::select(Projected_test, RDA1), type = "response")
+    pca_predictions = rep(0, dim(test)[1])
+    pca_predictions[pca_probabilities>.5] = 1
+    current_pca_accuracy <- sum(as.character(pca_predictions)==as.character(Ig_test))/length(pca_predictions)
+
+    rbind(Tibble_performances, tibble( Model="RDA_Logistic", Accuracy= current_pca_accuracy, CV=i, Repetition = Repeat )) -> Tibble_performances
+    
+  }
+}
+
+```
+
+```{r Check model performances, message=FALSE, warning=FALSE}
+
+#Statistical comparison of mean prediction
+aov(Accuracy ~ Model, data = Tibble_performances) %>% TukeyHSD() -> stat.test
+print(stat.test)
+
+  Tibble_performances %>% ggplot(aes(x=Model, y=Accuracy)) + geom_boxplot() + ggforce::geom_sina(aes(col=as.factor(Repetition))) + theme_bw() + scale_color_discrete(type = met.brewer(name="Klimt", n=5,type="discrete") ) + coord_flip() + labs(color = "CV repetition") %>% print()
+
+#Although we have no evidence for logistic using the number of positive peptides to be better than lasso, we will use the former due to simplicity.
+
+#Train model with whole IBD dataset
+Model <- glm(`CMV-IgG-positivity` ~ Positive_peptides, family=binomial(link='logit'), Serology_CMV_IBD_antibodies_2)
+#Predict in whole cohort
+cmv_data %>% select(-c(ID)) %>% apply(1, sum) -> Positive_peptides
+predict(Model, mutate(cmv_data, Positive_peptides = Positive_peptides) , type = "response") -> CMV_prediction
+
+
+```
+
+The PCA from all Peptides takes some time to compute. 
+```{r Visualize PCA, message=FALSE, warning=FALSE}
+rda(select( immuno_matrix_total[ , colSums(is.na(immuno_matrix_total)) == 0] , -ID)) -> PCA
+summary(PCA)$sites -> PCs
+as_tibble(PCs) %>% mutate(ID = cmv_data$ID, .before=1) %>% mutate(CMV_prediction = CMV_prediction, .before=2) -> PCs
+PCs %>% left_join(. , select(Serology_CMV_IBD_antibodies_2, c(ID, `CMV-IgG-positivity`) ) ) %>% mutate(`CMV-IgG-positivity` = ifelse(is.na(`CMV-IgG-positivity`), "unknown", `CMV-IgG-positivity`) ) -> PCs
+
+
+PCs %>% mutate(`CMV-IgG-positivity` = ifelse(`CMV-IgG-positivity` == "1", "Seronegative", ifelse(`CMV-IgG-positivity` == "2", "Seropositive", "unknown") ) ) %>% ggplot(aes(x=PC1, y=PC2, col=CMV_prediction,shape = `CMV-IgG-positivity`)) + geom_point(size=1) + theme_bw() + scale_color_gradientn(colours =   met.brewer(name="Cassatt1",n =5, type="continuous") ) + stat_ellipse(type = "t", aes(group=`CMV-IgG-positivity`, lty= `CMV-IgG-positivity`) ) + scale_linetype_manual(values=c(1,1,2))
+
+```
+
+
+Saving covariates to apply in other scripts
+```{r Get final data, message=FALSE, warning=FALSE}
+PCs %>% rename(sample_id = ID, CMV_prediction_prob = CMV_prediction) %>% mutate(CMV_prediction = ifelse(CMV_prediction_prob >0.5, 1, 0 ) ) %>% left_join(Covariates_PhipSeq, .) -> Covariates_PhipSeq2
+Covariates_PhipSeq2 %>% filter(grepl("LLD", ID)) %>% mutate(TimePoint = ifelse(grepl("_F", ID), "Followup", "Baseline" ) ) -> Covariates_PhipSeq2
+Covariates_PhipSeq2$ID = Covariates_PhipSeq2$ID %>%  str_replace("_F", "")
+write_tsv(Covariates_PhipSeq2, paste0(Location_dir,"Results/LLD_CMV_profile.tsv"))
+
+```
+
+
+```{r Check time consistency, message=FALSE, warning=FALSE}
+Covariates_PhipSeq2 %>% group_by(ID) %>% summarise(N = n()) %>% filter(N==2) -> FA
+
+Covariates_PhipSeq2 %>% filter(ID %in% FA$ID) %>% select(ID, TimePoint, CMV_prediction) %>% spread(TimePoint, CMV_prediction) %>% left_join(. , dplyr::select( filter(Covariates_PhipSeq2, TimePoint=="Baseline"), c(ID, Age))) %>% filter(! Baseline == Followup )  -> Info_timepoints
+
+Info_timepoints %>% dplyr::select(-ID) %>%  print()
+#Two people gaining CMV
+#Two people lossing CMV
+#Imputation error, or PhipSeq issue
+Covariates_PhipSeq2 %>% filter(ID %in% Info_timepoints$ID ) %>% select(ID, Sex, Age, CMV_prediction_prob, TimePoint) %>% arrange(ID) %>% dplyr::select(-ID)
+#Probably they are False negatives
+#(Prob=0.4 in b, 0.8 in FA)  /  (0.8 FA, 0.3 FA )
+#Threre might be a false positive (Prob 0.6 BL / 0.09 in FA)
+
+```
+In 4 years follow-up, only 2 people are predicted to gain CMV infection.
+

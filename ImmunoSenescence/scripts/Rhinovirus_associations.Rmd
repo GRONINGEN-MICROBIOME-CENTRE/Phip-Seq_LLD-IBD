@@ -1,0 +1,347 @@
+---
+title: "rhinovirus_associations"
+author: "Sergio Andreu-Sanchez"
+date: "5/23/2023"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Rhinovirs Omics - Script 1: Rhinovirus effects in telomere length, aging markers and blood cell proportions.
+
+*R Markdown* of first rhinovirus script. Read antibody data, telomere length measurements in 6 blood types (Flow-FISH), (blood) methylation age, T-cell maturation (sj-TRECS),  and cell counts measured in blood and predicted from blood bulk RNA-seq.
+
+
+```{r libraries, message=FALSE, warning=FALSE, results='hide'}
+Location_dir = "~/Documents/GitHub/CMV_Associations/"
+
+library(tidyverse)
+library(patchwork) #Combine plots
+library(lme4) # for mixed-model analysis of CMV-sex interaction
+library(regmed) #For multiple mediation
+library(MetBrewer)
+library(foreach) #paralellize FDR computation
+library(doParallel)
+source(paste0(Location_dir, "scripts/Functions.R"))
+source(paste0(Location_dir, "scripts/Functions_multivariate.R"))
+```
+
+
+```{r Read data,  message=FALSE, warning=FALSE, results='hide'}
+##PhIPSeq data
+readRDS(paste0(Location_dir,"Data/Immuno_matrix_postSelection.rds")) -> ImmunoMatrix
+
+        
+Prepare_AB = function(N = "32"){
+    'Keep samples from a specific cohort: 32=Lifelines Deep
+  Merge PhIPSeq profiels with covariates. Change IDs to LLD IDs and remove NAs (mainly follow-up samples)
+  Remove antibodies with missing data'
+    N = paste0(N, "_")
+    ImmunoMatrix %>% filter(grepl(N, ID)) -> ImmunoMatrix
+    ImmunoMatrix$ID = str_replace(ImmunoMatrix$ID , N, "")
+    read_tsv("~/Resilio Sync/Antibodies_WIS (1)/Plate records/Covariates.tsv") -> Phip_cov
+    ImmunoMatrix %>% rename(sample_id = ID) %>% left_join(. , select(Phip_cov, c(ID, sample_id))) %>% select(-sample_id) %>% filter(! is.na(ID)) -> ImmunoMatrix
+    ImmunoMatrix[ , colSums(is.na(ImmunoMatrix)) == 0] -> ImmunoMatrix #Removed antibodies with at least 1 NA
+    return(ImmunoMatrix)
+  }
+Prepare_AB("33") -> ImmunoMatrix_IBD
+Prepare_AB("32") -> ImmunoMatrix
+#Annotation
+readxl::read_excel("~/Resilio Sync/Antibodies_WIS (1)/Results/Supplemenatry_Tables/SupplementaryTable1.xlsx", sheet="SupTable1.1") %>% dplyr::rename(Feature = Peptide)  -> Annotation
+
+##Telomere data
+Age_markers <- read_tsv(paste0(Location_dir,"Data/Combined_data_uncorrected.tsv"))
+Age_markers %>% select(- colnames(Age_markers)[grepl("INT", colnames(Age_markers))] ) %>% rename(ID = Sample) -> Age_markers
+Telomere_markers <- colnames(Age_markers)[grepl("MTL",colnames(Age_markers))]
+Telomere_markers = Age_markers %>% dplyr::select(c("ID",Telomere_markers)) %>% mutate(MTL_gran = as.numeric(MTL_gran), `MTL_CD20+`=as.numeric(`MTL_CD20+`), `MTL_CD45+_CD20-`=as.numeric(`MTL_CD45+_CD20-`),`MTL_CD57+`=as.numeric(`MTL_CD57+`)) %>%
+    `colnames<-`(c("ID", "TL_Lymphocytes", "TL_Granulocytes", "TL_Naive_T-cells", "TL_Memory_T-cells","TL_B-cells","TL_NK-cells"))
+
+##Covariates analysis
+Covariates_pred = read_tsv(paste0(Location_dir,"Results/LLD_CMV_profile.tsv")) %>% filter(TimePoint == "Baseline")
+Covariates <- read_delim(paste0(Location_dir, "Data/Merged_Phenotypes_LLD.csv"), delim="|") %>% select(ID, smk_now, smk_full_year)
+left_join(Covariates_pred,Covariates ) -> Covariates_pred
+
+#Deconvoluted cell types
+all_cell_types = read_tsv(paste0(Location_dir,"Data/BIOS_cell_types_DeconCell_2019-03-08.LLD_subset.txt")) -> all_cell_types
+  #format
+  all_cell_types %>% gather(key = var_name, value = value, 2:ncol(all_cell_types)) %>% spread_(key = names(all_cell_types)[1],value = 'value') %>% rename(ID = var_name) -> all_cell_types
+  # negative values to 0, recalculate to 100 and ALR transformation using monocytes as denominator
+  Clean_and_ALR(all_cell_types) -> cell_matrix_alr
+  cell_matrix_xlr = cell_matrix_alr
+
+```
+
+
+Get CMV peptides and rhinoviral peptides, computed prevalences. Get age as a catergorical variable.
+
+```{r Prepare data, message=FALSE, warning=FALSE, results='hide'}
+#telomere imputation
+List_telomere_imputation = Impute_telomere_data(Telomere_markers)
+Telomere_markers = List_telomere_imputation[[1]]
+
+Annotation  %>% filter(grepl("CMV", Taxa) ) -> CMV
+Annotation  %>% filter(grepl("hinovirus", Taxa) ) -> Rhinovirus
+#Get total number of CMV and rhinovirus
+ImmunoMatrix %>% select(one_of(CMV$Feature)) %>% apply(1, sum)  -> N_CMV
+ImmunoMatrix %>% select(one_of(Rhinovirus$Feature)) %>% apply(1, sum)  -> N_rhino
+
+left_join(ImmunoMatrix, Telomere_markers) %>% mutate(N_CMV = N_CMV, N_rhinovirus=N_rhino) %>% drop_na()  -> Telomeres_analysis
+left_join(Covariates_pred, Telomeres_analysis) ->  Telomeres_analysis
+
+Telomeres_analysis %>% mutate(Age_group = ifelse(Age < 30, "Twenties", ifelse(Age<40, "Thirties", ifelse(Age<50, "Fourties", ifelse(Age<60, "Fifties", ifelse(Age<70, "Sixties", ifelse(Age<80, "Seventies", NA) ) ) )  )  ) ) -> Telomeres_analysis
+Telomeres_analysis %>% mutate(Age_group=fct_relevel(Age_group,c("Twenties","Thirties","Fourties", "Fifties", "Sixties", "Seventies"))) -> Telomeres_analysis
+#NAs are people with > 80 yearrs all. As there are few (4) I prefer to remove them from the categorical analysis
+#Telomeres_analysis %>% select(Age, Age_group) %>% filter( is.na(Age_group) )
+```
+
+Check prevalence of rhinovirus
+
+```{r Explore rhinovirus prevalence}
+agg_df <- aggregate(N_rhinovirus ~ Age_group, Telomeres_analysis, mean)
+names(agg_df) <- c("Age_group", "mean")
+agg_df$median <- aggregate(N_rhinovirus ~ Age_group, Telomeres_analysis, median)$N_rhinovirus
+
+Telomeres_analysis %>% filter(!is.na(Age_group)) %>% ggplot(aes(x=N_rhinovirus )) + geom_histogram(alpha=0.7) + theme_bw() +facet_wrap(~Age_group) + 
+  geom_vline(data = agg_df, aes(xintercept = mean, linetype = "dotted"), show.legend = FALSE) +
+  geom_vline(data = agg_df, aes(xintercept = median,  linetype = "dashed"), show.legend = FALSE)
+
+
+```
+
+
+Find out which rhinovirus peptide is best biomarker to relate with TL
+
+```{r whats the best rhinovirus biomarker}
+
+Function_Lasso_coef = function(Telomere_type, Telomeres_analysis, Peptides_test, N=100){
+  #Repeat glmnet N times, to assess stability of regularized coefficients
+  Coefficients_reg = tibble()
+  set.seed(989)
+  Formula = as.formula(paste0(c("`", Telomere_type, "` ~ ." ), collapse=""))
+  for (Timex in seq(1:N)){
+    Folds = caret::createFolds(y = seq(dim(Telomeres_analysis)[1]) ,k =  5)
+    for (Timey in Folds){
+    print(paste0(Telomere_type ," iteration ", Timex))
+    sample( Telomeres_analysis$ID, floor(length(Telomeres_analysis$ID)*0.8)) -> boost_selection
+    glmnetUtils::cv.glmnet(Formula, select(Telomeres_analysis %>% filter(ID %in% boost_selection) , c(Telomere_type, Peptides_test, "Age", "Sex")) , alpha = 1, nfolds = 10, type.measure="mse") -> Regularization
+    coef(Regularization, s = "lambda.min") -> Coef_reg
+    Coef_reg %>% as.matrix() %>% as.data.frame() %>% rownames_to_column("Peptides") %>% as_tibble() %>% mutate(N_Boostrap = Timex) %>% rbind(Coefficients_reg, . ) -> Coefficients_reg
+    }
+  }  
+  Coefficients_reg %>% rename(Coefficient = `1`) %>% mutate(TL = Telomere_type) -> Coefficients_reg
+  return(Coefficients_reg)
+}  
+
+
+Coefficients_reg_rhino = tibble()
+for (TL in colnames(Telomere_markers)){
+  if (TL == "ID"){ next }
+  Function_Lasso_coef(TL, Telomeres_analysis, c(Rhinovirus$Feature, "N_rhinovirus" )) %>% rbind(Coefficients_reg_rhino, .) -> Coefficients_reg_rhino
+}
+
+To_remove =  c( "(Intercept)", "Age", "Sex" )
+Coefficients_reg_rhino %>% filter(!Peptides %in% To_remove)  %>% group_by(Peptides, TL) %>% filter(! Coefficient == 0 ) %>% summarise(N_selection = n()) %>% arrange(desc(N_selection)) %>% filter(N_selection > 49) -> To_plot
+
+#Max of 500
+Coefficients_reg_rhino %>% filter(!Peptides %in% To_remove)  %>% group_by(Peptides, TL) %>% filter(! Coefficient == 0 ) %>% summarise(N_selection = n()) %>% arrange(desc(N_selection)) %>% group_by(Peptides) %>% summarise(M = median(N_selection), Max = max(N_selection), Min = min(N_selection) ) %>% arrange(desc(M))
+
+Coefficients_reg_rhino %>% filter(Peptides %in% To_plot$Peptides) %>% group_by(TL, Peptides)  %>% summarise(Mean_coef = mean(Coefficient), Max_coef = quantile(Coefficient, 0.975), Min_coef = quantile(Coefficient, 0.025)  ) %>% ggplot(aes(x=Peptides, y = Mean_coef)) + geom_point() + geom_errorbar(aes(ymin=Min_coef, ymax=Max_coef), width=.2 ) + facet_wrap(~TL) + theme_bw() + geom_hline(yintercept = 0) + coord_flip()
+
+Coefficients_reg_rhino %>% filter(Peptides %in% To_plot$Peptides)  %>% ggplot(aes(x=Peptides, y=Coefficient )) + facet_wrap(~TL) + geom_boxplot() + theme_bw() + geom_hline(yintercept = 0) + coord_flip()
+
+```
+
+Check between the top chosen peptides, which one associates better in a miexed model with everything.
+Test for confounders in assocation
+
+
+```{r Telomere length mixed model and plot residuals group}
+  
+Telomeres_analysis %>% select( c("N_rhinovirus", "twist_35344", "CMV_prediction", "Age", "Sex", "smk_now", "smk_full_year", colnames(Telomere_markers) ) ) %>% gather(cell_type, TL, 9:14) -> Telomeres_analysis_wide
+
+#Mixed-effect model
+  Telomeres_analysis %>% filter(!is.na(Age_group)) %>% gather(Telomere, Length,  colnames(Telomeres_analysis)[grepl("TL", colnames(Telomeres_analysis))]) ->Telomeres_analysis_wide
+  
+  Telomeres_analysis_wide %>% lmerTest::lmer(  Length ~  + N_rhinovirus + Telomere + (1|ID) , .) %>% summary()
+  Telomeres_analysis_wide %>% lmerTest::lmer(  Length ~  twist_35344 +  Telomere + (1|ID) , .) %>% summary()
+  
+#N_rhinovirus correlates better  
+  
+#Without CMV
+Telomeres_analysis_wide %>% lmerTest::lmer(  Length ~  Sex + N_rhinovirus + CMV_prediction  + Telomere + (1|ID) , .) %>% summary()
+#Include Age
+Telomeres_analysis_wide %>% lmerTest::lmer(  Length ~ Age_group + Sex + N_rhinovirus + CMV_prediction  + Telomere + (1|ID) , .) %>% summary()
+#including smoking
+Telomeres_analysis_wide %>% lmerTest::lmer(  Length ~ Age_group + Sex + N_rhinovirus + CMV_prediction + smk_full_year  + Telomere + (1|ID) , .) %>% summary()
+
+
+#Need to do the plot with residualized data
+Remove_variability( Telomere_markers, Telomeres_analysis, Covariates_n = c("Age_group")  ) -> Telomeres_residuals
+left_join(Telomeres_analysis, Telomeres_residuals, by="ID", suffix=c("","_residualized")) %>%  gather(Telomere, Length,  c(paste0(colnames(Telomeres_analysis)[grepl("TL", colnames(Telomeres_analysis))], "_residualized") )   ) %>%
+  filter(!is.na(Age_group)) %>%  ggplot(aes(x=N_rhinovirus, y = Length, col=Age_group )) + geom_point(alpha=0.2) + theme_bw() + scale_color_discrete() + geom_smooth(method = "lm", se=F) + facet_wrap(~Telomere) + scale_color_manual(values = met.brewer(name="Klimt", n=6,type="discrete")) + xlab("Breadth peptide-bound rhinovirus") + ylab("Age-corrected residuals of\n Telomere Length") -> Fig
+
+ggsave(paste0(Location_dir, "Results/Figures/Rhinovirus_vs_TL.pdf"), Fig)
+  
+
+```
+
+
+```{r Effects on TL}
+##Associations with cell counts
+Make_rhino_assc1 = function(Telomeres_analysis){
+  Association_rhino = tibble()
+  for ( i in colnames(select(Telomere_markers, -ID)) ){
+      Formula = as.formula(  paste0("`",i,"` ~ N_rhinovirus + CMV_prediction + Age_group +Sex" ) )
+      Telomeres_analysis %>% 
+        lm(Formula, . ) -> R_t ; Conf = confint(R_t) ; R_t %>% summary() -> R_t 
+      cbind( as.data.frame(R_t$coefficients), Conf)[c("N_rhinovirus", "CMV_prediction") ,] %>% rownames_to_column("Regressor")  %>% as_tibble() %>% mutate(Cell = i) %>% rbind(Association_rhino, .) -> Association_rhino
+    }
+    return(Association_rhino)
+}
+Make_rhino_assc1(Telomeres_analysis) -> Association_TL
+```  
+
+```{r Effects on cell counts}
+##Associations with cell counts
+Make_rhino_assc2 = function(DF, Telomeres_analysis){
+  Association_rhino = tibble()
+  for ( i in colnames(select(DF, -ID)) ){
+      Formula = as.formula(  paste0("`",i,"` ~ N_rhinovirus + CMV_prediction + Age_group +Sex" ) )
+      Telomeres_analysis %>% left_join( . , DF, by="ID" ) %>%
+        lm(Formula, . ) -> R_t ; Conf = confint(R_t) ; R_t %>% summary() -> R_t 
+      cbind( as.data.frame(R_t$coefficients), Conf)[c("N_rhinovirus", "CMV_prediction") ,] %>% rownames_to_column("Regressor")  %>% as_tibble() %>% mutate(Cell = i) %>% rbind(Association_rhino, .) -> Association_rhino
+    }
+    return(Association_rhino)
+}
+Make_rhino_assc2(cell_matrix_xlr, Telomeres_analysis) -> Association_rhino_cell
+
+Association_rhino_cell %>% arrange(`Pr(>|t|)` ) %>% mutate(FDR = p.adjust(`Pr(>|t|)` , "fdr")) -> Association_rhino_cell
+Association_rhino_cell %>% select(Regressor, `t value`, Cell) %>% pivot_wider(., names_from = Regressor, values_from = `t value`) %>% as.data.frame() %>% column_to_rownames("Cell")  %>% pheatmap::pheatmap()
+  Association_rhino_cell %>% ggplot(aes(x=`t value`, y=Cell, col=Regressor, shape=`FDR`<0.05  )) + geom_point() + theme_bw() + geom_vline(xintercept = 0, linetype="dashed") #+ geom_errorbar(aes(xmin=`2.5 %` , xmax=`97.5 %`, col=Regressor, y=Cell), width=.2)
+Association_rhino_cell %>% ggplot(aes(x=Estimate, y=Cell, shape=`FDR`<0.05, col=Estimate<0  )) + geom_point() + theme_bw() + geom_vline(xintercept = 0, linetype="dashed") + geom_errorbar(aes(xmin=`2.5 %` , xmax=`97.5 %`, y=Cell), width=.2) + facet_wrap(~Regressor, scales = "free_x") + scale_color_manual(values = c("blue", "red"), guide = "none" ) -> Rhino_vs_cells
+  
+ggsave(filename = paste0(Location_dir,"Results/Figures/CMV_Rhinovirus_cells.pdf") , plot = Rhino_vs_cells)
+```  
+
+Get permutatetion-based FDR for associations
+```{r Permutation analysis}
+
+Compute_FDR2 =  function(P, Permutation_results,Permutations = 100 ){
+  Order = order(P)
+  tibble(Position = Order, FDR = NA) -> values
+  fdr_values = c()
+  for ( i in seq(P) ){
+    Threshold = P[which(Order == i)]
+    FDR_v = sum(Permutation_results <= Threshold) / Permutations / i
+    if (FDR_v > 1 ){ FDR_v = 1 }
+    values %>% mutate(FDR = ifelse(Position == i, FDR_v, FDR  )) -> values
+  }
+  return(values$FDR)
+}  
+
+Get_Permutation_FDR = function(Test, Associations, Permutations=100 ){
+  set.seed(87)
+  N_perm = Permutations
+  
+  cl <- makeCluster(4)
+  registerDoParallel(cl)
+  
+  
+  permute_assoc <- function(seed, Taxonomy_test) {
+    # Generate permuted CMV predictions
+    Permuted_rhino <- sample(Test$N_rhinovirus, replace = FALSE, size = nrow(Test))
+    # Perform association analysis
+     Perform_assoc(Test %>% mutate(N_rhinovirus=Permuted_rhino ) )
+  }
+
+  # Run permutation loop in parallel
+  Permuted_ps <- foreach(Permutation = 1:N_perm, .combine = c, .packages=c("foreach", "tibble", "dplyr"), .export=c("Perform_assoc", "cell_matrix_xlr", "Telomere_markers") ) %dopar% {
+  permute_assoc(Permutation, Test)$`Pr(>|t|)`
+  }
+
+  # Clean up parallel backend
+  stopCluster(cl)
+  
+  FDR = Compute_FDR2(Associations$`Pr(>|t|)`, Permuted_ps, N_perm )
+  Associations %>% mutate(FDR_permutation = FDR) %>% arrange(`Pr(>|t|)`) -> Associations
+  return(Associations)
+}
+
+Perform_assoc = function(To_test, Cells= colnames(cell_matrix_xlr), TL=colnames(Telomere_markers) ){
+  Result_associations = tibble()
+  Result_associations <- foreach(Feature = setdiff(c( Cells, TL ), "ID")  , .combine = rbind) %do% {
+    if (Feature == "ID"){ next }
+    Model <- lm(paste0("`", Feature, "` ~ N_rhinovirus + CMV_prediction + Age_group +Sex"), To_test)
+    Coef <- coef(summary(Model))
+    tibble(
+      Feature = Feature ,
+      Estimate = Coef["N_rhinovirus", "Estimate"],
+      `Std. Error` = Coef["N_rhinovirus", "Std. Error"],
+      `t value` = Coef["N_rhinovirus", "t value"],
+      `Pr(>|t|)` = Coef["N_rhinovirus", "Pr(>|t|)"]
+    )
+  }
+  return(Result_associations)
+}
+
+
+
+rbind(Association_TL, Association_rhino_cell %>% select(-FDR) ) %>% filter(Regressor == "N_rhinovirus") %>% Get_Permutation_FDR(left_join(Telomeres_analysis, cell_matrix_xlr)  , . , Permutations = 1000 ) -> SummaryStats
+
+write_tsv(SummaryStats,  paste0(Location_dir,"Results/Rhinovirus_cells&TL.tsv") )
+
+
+```
+
+```{r Mediation analysis}
+  lambda.grid <- seq(from = 0.4, to = 0.01, by = -0.01)
+  Telomeres_analysis %>% left_join( . , cell_matrix_alr, by="ID" ) %>% dplyr::select( c("ID", "CMV_prediction", "N_rhinovirus", colnames(Telomere_markers), colnames(cell_matrix_alr)  ) ) -> Matched_data
+for (Column in colnames(Matched_data)){
+  if (Column %in% c("ID", "CMV_prediction") ){ next } 
+    Matched_data[Column] = scale(Matched_data[Column])
+}
+Matched_data %>% drop_na() -> Matched_data
+x <-  select(Matched_data, c(CMV_prediction, N_rhinovirus ))
+y <- select(Matched_data, colnames( select(Telomere_markers, -ID) )  )
+med <- select(Matched_data, colnames( select(cell_matrix_alr, -ID) )  )
+
+fit.grid <-  mvregmed.grid(x, med, y, lambda.grid)
+#summary(fit.grid)
+plot.mvregmed.grid(fit.grid)
+#Take best model
+mvfit.best <- mvregmed.grid.bestfit(fit.grid)
+
+summary(mvfit.best)
+
+
+
+
+#Default eps= 0.01 ;set to 0.04, which will show three CMV-telomere relpationships
+mvfit.edges <- mvregmed.edges(mvfit.best, eps = 0.01) #Change EPS to show more/less edges
+pdf(paste0(Location_dir,"Results/Figures/Network_CMV_n_rhino.pdf"))
+plot.mvregmed.edges(mvfit.edges, x.color = "palegreen", y.color = "palevioletred", med.color = "skyblue", v.size = 10, seed = 3)
+dev.off()
+
+
+mvfit.best$delta %>% as.data.frame() %>% rownames_to_column("cell_count") %>% as_tibble()
+
+mvfit.best$alpha %>% as.data.frame() %>% rownames_to_column("cell_count") %>% as_tibble() %>% filter(N_rhinovirus > 0 ) -> Effect
+
+mvfit.best$beta %>% as.data.frame() %>% rownames_to_column("TL") %>% as_tibble() %>% filter(TL %in% c( "TL_Naive_T-cells", "TL_Memory_T-cells" ) ) %>% gather(Cell, effect ,2:33) %>% filter(! effect == 0 ) %>% filter(Cell %in% Effect$cell_count)
+
+#Show some individual mediation
+library(mediation)
+Matched_data %>% left_join(Telomeres_analysis %>% dplyr::select(ID, Sex, Age ) ) %>% select(`CD8+ Naive CD45RO- CD27+`,N_rhinovirus, Age,Sex,`TL_Naive_T-cells`    ) %>% drop_na() %>% rename(CD8plus_Naive_CD45ROminus_CD27plus = `CD8+ Naive CD45RO- CD27+`) -> Matched_data2
+
+#In Naiv T-cells
+fit.mediator=lm(CD8plus_Naive_CD45ROminus_CD27plus ~ N_rhinovirus + Age + Sex  ,  Matched_data2 )
+fit.dv=lm(`TL_Naive_T-cells` ~ N_rhinovirus +CD8plus_Naive_CD45ROminus_CD27plus  + Age + Sex, Matched_data2 )
+results = mediate(fit.mediator, fit.dv, treat='N_rhinovirus', mediator='CD8plus_Naive_CD45ROminus_CD27plus', boot=T)
+summary(results) #17%
+plot(results)
+
+  
+```  
+

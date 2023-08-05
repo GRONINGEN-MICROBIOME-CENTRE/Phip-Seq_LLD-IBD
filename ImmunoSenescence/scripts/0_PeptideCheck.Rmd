@@ -1,0 +1,131 @@
+---
+title: "0_Selection&Exploration"
+author: "Sergio Andreu-Sanchez"
+date: "9/9/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# CMV Omics - Script 0: Decide which peptides belong to CMV. Check proteins.
+
+```{r libraries, message=FALSE, warning=FALSE, results='hide'}
+library(tidyverse)
+library(readxl)
+library(pheatmap)
+library(vegan)
+library(cluster)
+library(kmer)
+library(ape)
+library(MetBrewer)
+```
+
+Reading data
+
+
+```{r Read data, message=FALSE, warning=FALSE, results='hide'}
+Location_dir = '~/Documents/GitHub/CMV_Associations/'
+
+
+read_excel("~/Resilio Sync/Antibodies_WIS (1)/Results/Supplemenatry_Tables/SupplementaryTable1.xlsx", sheet=2) -> Peptides_Annotation
+
+
+immuno_matrix_total <- readRDS(paste0(Location_dir, 'Data/Immuno_matrix_postSelection.rds')) %>% filter(grepl("32_|33_", ID ) )
+
+
+#Selection of Peptides that represent CMV proteins
+cmv_peptides <- read_tsv(paste0(Location_dir,"Results/CMV_peptides.tsv")) 
+cmv_peptides = cmv_peptides$Peptide
+cmv_peptides = cmv_peptides[! cmv_peptides == "agilent_7061"] #wrong one
+immuno_matrix_total %>% dplyr::select(c("ID", cmv_peptides)) -> cmv_data #There are no NAs
+
+
+```
+
+
+Check similarity in presence/absence profiles
+
+```{r Peptide presence similarity,  warning=FALSE}
+
+cmv_data  %>% dplyr::select(-c(ID)) %>% t() %>% vegdist(., method = "manhattan") %>% as.matrix() %>% 
+  `colnames<-`( colnames(cmv_data)[2:dim(cmv_data)[2]] ) -> Distance_matrix
+Distance_matrix %>% pam(. , k=2) -> C
+Clusters= C$clustering
+Clusters %>% as.data.frame() -> Clusters2
+Clusters2 %>% mutate(Cluster = as.factor(`.`)) %>% dplyr::select(-`.`) -> Clusters2
+rownames(Clusters2) = names(Clusters)
+
+#Cluster colors
+met.brewer(name="Klimt", n=2, type="discrete" ) -> A
+ann_colors = list( Cluster = c(`1` = A[1], `2`=A[2] ) )
+#Heatmap
+pheatmap(mat = Distance_matrix, annotation_col = Clusters2, color = met.brewer(name="Cassatt2", type="continuous"), annotation_colors = ann_colors ) %>% print()
+
+
+```
+
+Check similarity of the sequences using Kmers
+
+
+```{r Alignment  similarity, warning=FALSE, message=FALSE}
+Get_kmer_distance = function(DF, KMER=5){
+  DF$aa_seq = str_replace(string = DF$aa_seq, pattern = " \\(./.\\)", replacement = "")
+  DF$aa_seq %>% as.list() %>% as.AAbin() %>% kdistance(., k = KMER) %>% as.matrix()  -> D
+  rownames(D) = DF$Peptide
+  D %>% pheatmap(color = met.brewer(name="Cassatt2", type="continuous"))
+}
+
+Peptides_Annotation %>% filter(Peptide %in% rownames(filter(Clusters2, Cluster==1) )) %>% dplyr::select(Peptide, aa_seq)  -> C1
+Get_kmer_distance(C1)
+
+Peptides_Annotation %>% filter(Peptide %in% rownames(filter(Clusters2, Cluster==2) )) %>% dplyr::select(Peptide, aa_seq) -> C2
+Get_kmer_distance(C2)
+
+
+Peptides_Annotation %>% filter(Peptide %in% colnames(cmv_data)) %>% dplyr::select(Peptide, aa_seq) -> C0
+Get_kmer_distance(C0)
+
+```
+
+As we see, there are no many redundant peptides. But it might be due to the fact that they are different chuncks of the same protein. Let's see the annotation of the clusters
+
+```{r Annotation clusters, warning=FALSE, message=FALSE}
+Peptides_Annotation %>% filter(Peptide %in% colnames(cmv_data)) %>% select(Peptide, aa_seq, full.name) %>% left_join(., Clusters2 %>% rownames_to_column("Peptide") ) -> Info_Clusters
+
+Same = c("positive (from uniprot): Human herpesvirus 5  Envelope glycoprotein M", "positive (exact): Human herpesvirus 5  Envelope glycoprotein M")
+Info_Clusters %>% mutate(`full.name` = ifelse(`full.name` %in% Same,"Glycoprotein M", `full.name` ) ) %>% group_by(Cluster, `full.name`) %>% summarise(N = n())  %>% arrange(desc(N)) %>% print(n=22)
+
+```
+
+
+```{r, Get fasta per protein}
+
+Peptides_Annotation %>% filter(Peptide %in% colnames(cmv_data)) %>% select(Peptide, aa_seq, full.name) -> Peptide_seq
+
+List_proteins = list()
+n = 1
+for (Protein in unique(Peptide_seq$full.name )){
+  Peptide_seq %>% filter(`full.name` == Protein) %>% dplyr::select(-`full.name`) -> Protein_seqs
+  S = sapply(Protein_seqs$aa_seq, function(x){ str_split(x, " \\(")[[1]][1] })
+  Add = paste0( paste0(">",Protein_seqs$Peptide),"\n", S, sep="\n")
+  
+  List_proteins = append(List_proteins, list(Add) )
+  names(List_proteins)[[n]] = Protein
+  n = n + 1
+}
+sink(paste0(Location_dir,"/Results/Sequences.fa"))
+print(List_proteins)
+sink()
+#After blasting to reference (GCF_000845245.1) I observe two proteins that should not belong to CMV: twist_31672 (replciase protein, sars) ; twist_27929 (spike protein, zaire ebolavirus), thus, I will remove them from the list
+#blastp -db data/GCF_000845245.1/protein.faa -query  Search  -outfmt 7 -evalue 1e-10
+
+#All peptides have been alligened to their protein reference (GCF_000845245.1), using MAFFT; --addfragments  to reference
+
+```
+
+Using the sequences from the proteins, we generated multiple sequence alignments with their reference protein from the reference genome from CMV (GCF_000845245.1). For proteins where the name was not in agreement between PhIP-Seq annotation and the reference's, I used blastp on a database of the reference proteins to find which protein is the reference. If no matches, I conducted a blastp in the online suite using the non-redundant protein sequence database. There I uncovered that some of the peptides were not from CMV, so I removed them. For the rest, all of them had a perfect alignment to GCF_000845245.1.
+From 169 annotated sequences in GCF_000845245.1, our PhIP-Seq library contains 14 different proteins.
+
+
