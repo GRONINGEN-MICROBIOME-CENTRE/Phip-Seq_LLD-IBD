@@ -203,6 +203,40 @@ Make_rhino_assc1 = function(Telomeres_analysis){
 Make_rhino_assc1(Telomeres_analysis) -> Association_TL
 ```  
 
+Since rhinoviruses have a different age prevalence, we will match the age of CMV groups
+```{r Effects on TL after matching}
+set.seed(8112)
+library(MatchIt)
+matchit(formula = twist_35344 ~ Age + Sex, data = Telomeres_analysis %>% filter(! (is.na(Age) | is.na(Sex) | is.na(twist_35344) ) ) , method="nearest", ratio=1  ) -> Telomeres_analysis_match
+plot(summary(Telomeres_analysis_match), xlim=c(0,0.14) ) 
+Telomeres_analysis_match <- match.data(Telomeres_analysis_match)
+
+#Assocation 
+Make_rhino_assc1(Telomeres_analysis_match) -> Association_TL_matched
+print("Assocaiton all")
+Association_TL_matched
+
+#Assocaiton with Mixed-models
+Telomeres_analysis_match %>% select( c("N_rhinovirus", "twist_35344", "CMV_prediction", "Age", "Age_group", "Sex", "smk_now", "smk_full_year", colnames(Telomere_markers) ) ) %>% gather(cell_type, TL, 10:15) -> Telomeres_analysis_wide_match
+#Mixed-effect model
+print("Assocation mixed")
+Telomeres_analysis_wide_match %>% lmerTest::lmer(  TL ~  + N_rhinovirus + cell_type + (1|ID) , .) %>% summary()
+#With CMV
+print("Assocation mixed CMV")
+Telomeres_analysis_wide_match %>% lmerTest::lmer(  TL ~  Sex + N_rhinovirus + CMV_prediction  + cell_type + (1|ID) , .) %>% summary()
+#Include Age
+print("Assocation mixed CMV + Age")
+Telomeres_analysis_wide_match %>% lmerTest::lmer(  TL ~ Age_group + Sex + N_rhinovirus + CMV_prediction  + cell_type + (1|ID) , .) %>% summary()
+#including smoking
+print("Assocation mixed CMV + Age + Smoke")
+Telomeres_analysis_wide_match %>% lmerTest::lmer(  TL ~ Age_group + Sex + N_rhinovirus + CMV_prediction + smk_full_year  + cell_type + (1|ID) , .) %>% summary()
+
+
+
+```  
+
+
+
 ```{r Effects on cell counts}
 ##Associations with cell counts
 Make_rhino_assc2 = function(DF, Telomeres_analysis){
