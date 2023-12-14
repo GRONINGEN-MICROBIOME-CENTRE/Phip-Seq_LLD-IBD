@@ -235,16 +235,18 @@ Covariates %>% left_join(., Top_PCs) -> Covariates
 ###############################
 ###2. MATCH AND SPLIT##########
 ###############################
-
+IDs_SC = read_tsv("Downloads/donor_md.txt") %>% rename(ID = donor)
 Do_upset = function(All_IDs){
   tibble(ID = All_IDs) %>% mutate(PhIPSeq = ifelse(ID %in% ImmunoMatrix$ID, 1, 0), 
                                   Telomeres = ifelse(ID %in% Telomere_markers$ID, 1, 0),
-                                  Proteomics = ifelse(ID %in% Proteomics$ID, 1, 0),
+                                  #Proteomics = ifelse(ID %in% Proteomics$ID, 1, 0),
                                   Cytokines = ifelse(ID %in% Cytokines$ID, 1, 0),
                                   Methylation_clocks = ifelse(ID %in% Methylation_markers$ID, 1, 0),
                                   sjTRECs = ifelse(ID %in% sjTRECs$ID, 1, 0),
-                                  NMR_clocks = ifelse(ID %in% left_join(MetaboAge, MetaboHealth)$ID, 1, 0) ) %>%
-    as.data.frame() %>% column_to_rownames("ID") %>% UpSetR::upset(nsets = 10, nintersects = 10, order.by = "freq") -> DataSet_overview
+                                  bulkRNAseq = ifelse(ID %in% cell_matrix_xlr$ID, 1, 0 ),
+                                  scRNAseq = ifelse(ID %in% IDs_SC$ID, 1, 0 ),
+                                  Metabolic_clocks = ifelse(ID %in% left_join(MetaboAge, MetaboHealth)$ID, 1, 0) ) %>%
+    as.data.frame() %>% column_to_rownames("ID") %>% UpSetR::upset(nsets = 10, nintersects = 15, order.by = "freq", text.scale=2 ) -> DataSet_overview
   return(DataSet_overview)
   
 }
@@ -296,6 +298,50 @@ lm( paste0("MetaboAge ~ ", paste(KN[2:length(KN)], collapse = "+")), left_join(M
 KN_cytokines = c("ID", "Age", "Sex",  "Lymph", "Eryth", "Mono", "Neutro", "Thrombo", "Eosino", "Blood_baso","estrogens")
 KN_methylation = c("ID", "Age", "Sex",  "Lymph", "Mono", "Neutro")
 KN_health = c("ID", "Sex",  "Lymph", "Mono", "Eryth")
+
+################################
+######Antibody exposure score####
+#################################
+ImmunoMatrix %>% select(-ID) %>% apply(1, function(x){ x= x[!is.na(x)] ; sum(x) }  ) -> N_antibodies
+left_join( Covariates, ImmunoMatrix %>% mutate(Antibody_N = N_antibodies) %>% select(ID, Antibody_N) ) -> Covariates
+
+Run_associations_exposureScore = function(Covariates, Antibody_column ){
+  cor.test( as_vector(Covariates[Antibody_column]), Covariates$Age, method="spearman") %>% print()
+  left_join(Aging_health_markers, Covariates, by="ID") -> to_test
+  results_score = tibble()
+  for (marker in colnames(Aging_health_markers)  ){
+    if (marker == "ID"){ next }
+    to_test %>% select("Age", "Sex", marker, Antibody_column ) %>% drop_na() -> for_model
+    pcor.test(x = as.vector(for_model[marker]) , y = as.vector(for_model[Antibody_column]) , z =for_model %>% select(c("Age","Sex")) , method = "spearman") -> Correlation_t
+    Correlation_t %>% as_tibble() %>% mutate(bio_age = marker) %>% rbind(results_score, . ) ->  results_score
+  }
+  print(results_score %>% arrange(p.value ) %>%  mutate(FDR= p.adjust(p.value, "fdr")) )
+}
+
+Run_associations_exposureScore(Covariates,"Antibody_N")
+
+#This can be stratified in different pathogen groups
+#Pathogens - any
+read_excel("~/Downloads/pathogens_final.xlsx") -> Pathogens
+Annotation %>% filter(Taxa %in% filter(Pathogens, GROUP=="T")$TAXA) ->Pathogen_peptides
+ImmunoMatrix %>% select(one_of(Pathogen_peptides$Feature)) %>% apply(1, function(x){ x= x[!is.na(x)] ; sum(x) }  ) -> N_antibodies_patho
+left_join( Covariates, ImmunoMatrix %>% mutate(AntibodyPathogen_N = N_antibodies_patho) %>% select(ID, AntibodyPathogen_N) ) -> Covariates
+
+Run_associations_exposureScore(Covariates,"AntibodyPathogen_N")
+
+read_excel("~/Resilio Sync/Antibodies_WIS (1)/Results/Supplemenatry_Tables/SuplemmentaryTable2.xlsx", sheet = 8) -> DF
+DF %>% filter(pheno == "Age") %>% select(peptide, Taxa, FDR, beta) %>% filter(beta > 0) -> Pos 
+DF %>% filter(pheno == "Age") %>% select(peptide, Taxa, FDR, beta) %>% filter(beta < 0) -> Neg
+ImmunoMatrix %>% select(Pos$peptide) %>% apply(1, function(x){ x= x[!is.na(x)] ; sum(x) }  ) -> N_antibodies_aging
+ImmunoMatrix %>% select(Neg$peptide) %>% apply(1, function(x){ x= x[!is.na(x)] ; sum(x) }  ) -> N_antibodies_youth
+left_join( Covariates, ImmunoMatrix %>% mutate(Young_ab = N_antibodies_youth, Old_ab = N_antibodies_aging ) %>% select(ID, Young_ab, Old_ab) ) -> Covariates
+
+Run_associations_exposureScore(Covariates,"Young_ab")
+Covariates %>% left_join(Aging_health_markers, . ) %>% ggplot(aes(y=MetaboHealth, x=Young_ab, col=as.factor(Sex)) ) + geom_point() + geom_smooth(method = "lm") + theme_bw()
+
+Run_associations_exposureScore(Covariates,"Old_ab")
+
+
 
 
 ########################

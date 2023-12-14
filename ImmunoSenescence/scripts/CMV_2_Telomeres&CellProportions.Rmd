@@ -408,20 +408,21 @@ Plot_heatmaps = function(C1, C2, Output_name1="Results/Figures/Aging_heatmap_CMV
   #save
   ggsave( paste0(Location_dir, Output_name1), plot = heatmap1.2, dpi = 300)
   ggsave( paste0(Location_dir, Output_name2), plot = heatmap2, dpi = 300)
+  return(list(heatmap1.2,heatmap2))
 }
 
 
-Aging_health_markers %>% dplyr::select(-ID) %>% drop_na() %>% cor() %>% pheatmap()
+Aging_health_markers %>% dplyr::select(-ID) %>% drop_na() %>% cor(method="spearman") %>% pheatmap()
 
 
 #For CMV positive
 Aging_health_markers %>% filter(ID %in%  filter(Covariates, CMV_prediction == 1)$ID ) %>% drop_na() ->S1
-S1 %>% dplyr::select(-ID) %>% drop_na() %>% cor()  -> C1
+S1 %>% dplyr::select(-ID) %>% drop_na() %>% cor(method="spearman")  -> C1
 
 
 #For CMV negative
 Aging_health_markers %>% filter(ID %in%  filter(Covariates, CMV_prediction == 0)$ID ) %>% drop_na() -> S2
-S2 %>% dplyr::select(-ID)  %>% cor() -> C2
+S2 %>% dplyr::select(-ID)  %>% cor(method="spearman") -> C2
 
 Plot_heatmaps(C1,C2)
 Compute_heterogeneity(C1, C2) -> Diff_noresid
@@ -432,9 +433,9 @@ Remove_variability(Aging_health_markers, Covariates, Covariates_n = c("Age") ) -
 
 
 Aging_health_markers2 %>% filter(ID %in%  filter(Covariates, CMV_prediction == 1)$ID ) %>% drop_na() ->S3
-S3 %>% dplyr::select(-ID)  %>% cor()  -> C3
+S3 %>% dplyr::select(-ID)  %>% cor(method="spearman")  -> C3
 Aging_health_markers2 %>% filter(ID %in%  filter(Covariates, CMV_prediction == 0)$ID ) %>% drop_na() ->S4
-S4 %>% dplyr::select(-ID)  %>% cor()  -> C4
+S4 %>% dplyr::select(-ID)  %>% cor(method="spearman")  -> C4
 
 Plot_heatmaps(C3,C4, "Results/Figures/ResidAging_heatmap_CMVpositive.png", "Results/Figures/ResidAging_heatmap_CMVnegative.png")
 Compute_heterogeneity(C3, C4, dim(S3)[1], dim(S4)[1] ) -> Diff_resid
